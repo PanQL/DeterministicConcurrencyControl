@@ -1,0 +1,148 @@
+syntax = "proto3";
+
+package calvinfs;
+
+service Shard {
+  rpc Ping(PingRequest) returns (PingResponse);
+  rpc ExecuteBatch(ExecuteBatchRequest) returns (ExecuteBatchResponse);
+  rpc LocalReadResult(LocalReadResultRequest) returns (LocalReadResultResponse);
+  rpc DumpState(DumpStateRequest) returns (DumpStateResponse);
+}
+
+service Sequencer {
+  rpc Ping(PingRequest) returns (PingResponse);
+  rpc SubmitBatch(SubmitBatchRequest) returns (SubmitBatchResponse);
+}
+
+message PingRequest {}
+
+message PingResponse {
+  string node_id = 1;
+  uint64 shard_id = 2;
+}
+
+message ExecuteBatchRequest {
+  Batch batch = 1;
+}
+
+message ExecuteBatchResponse {
+  uint64 batch_id = 1;
+  uint64 shard_id = 2;
+  repeated TxResultRecord tx_results = 3;
+}
+
+message LocalReadResultRequest {
+  uint64 batch_id = 1;
+  uint64 tx_id = 2;
+  uint64 from_shard = 3;
+  repeated ReadEntry reads = 4;
+}
+
+message LocalReadResultResponse {}
+
+message DumpStateRequest {}
+
+message DumpStateResponse {
+  repeated InodeEntry entries = 1;
+}
+
+message Batch {
+  uint64 batch_id = 1;
+  repeated OrderedTx txs = 2;
+}
+
+message OrderedTx {
+  uint64 tx_id = 1;
+  uint32 batch_index = 2;
+  FsOp op = 3;
+  repeated string read_set = 4;
+  repeated string write_set = 5;
+}
+
+message FsOp {
+  oneof op {
+    Create create = 1;
+    Mkdir mkdir = 2;
+    Unlink unlink = 3;
+    Rmdir rmdir = 4;
+    Rename rename = 5;
+    Stat stat = 6;
+  }
+}
+
+message Create {
+  string path = 1;
+}
+
+message Mkdir {
+  string path = 1;
+}
+
+message Unlink {
+  string path = 1;
+}
+
+message Rmdir {
+  string path = 1;
+}
+
+message Rename {
+  string src = 1;
+  string dst = 2;
+}
+
+message Stat {
+  string path = 1;
+}
+
+message InodeEntry {
+  string key = 1;
+  Inode inode = 2;
+}
+
+message Inode {
+  NodeKind kind = 1;
+  uint64 child_count = 2;
+}
+
+message ReadEntry {
+  string key = 1;
+  oneof value {
+    Inode inode = 2;
+    Missing missing = 3;
+  }
+}
+
+message Missing {}
+
+enum NodeKind {
+  NODE_KIND_UNSPECIFIED = 0;
+  NODE_KIND_FILE = 1;
+  NODE_KIND_DIRECTORY = 2;
+}
+
+enum TxResult {
+  TX_RESULT_UNSPECIFIED = 0;
+  TX_RESULT_OK = 1;
+  TX_RESULT_NOT_FOUND = 2;
+  TX_RESULT_ALREADY_EXISTS = 3;
+  TX_RESULT_NOT_DIRECTORY = 4;
+  TX_RESULT_DIRECTORY_NOT_EMPTY = 5;
+  TX_RESULT_INVALID = 6;
+}
+
+message TxResultRecord {
+  uint64 tx_id = 1;
+  uint64 shard_id = 2;
+  TxResult result = 3;
+}
+
+message SubmitBatchRequest {
+  repeated FsOp ops = 1;
+}
+
+message SubmitBatchResponse {
+  uint64 batch_id = 1;
+  repeated uint64 tx_ids = 2;
+  repeated TxResultRecord tx_results = 3;
+}
