@@ -5,18 +5,20 @@ use crate::executor::{
 };
 use crate::lock::{LockGrant, LockTable};
 use crate::model::{
-    Batch, BatchId, FsOp, Inode, Key, OrderedTx, ReadValue, ShardId, TxId, TxResultRecord,
+    Batch, BatchId, FsOp, Inode, Key, OrderedTx, ReadValue, ShardId, TxId, TxResult, TxResultRecord,
 };
 use crate::proto::pb;
 use crate::router::{Participants, ShardLayout};
 use crate::storage::RedbInMemoryInodeStore;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use std::time::Duration;
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
 
 const BATCH_QUEUE_CAPACITY: usize = 16;
 const DEFAULT_MAILBOX_CAPACITY: usize = 1024;
+const SEQUENCER_COMMAND_CAPACITY: usize = 1024;
+const DEFAULT_BATCH_FLUSH_INTERVAL: Duration = Duration::from_millis(1);
 
 #[derive(Clone, Debug)]
 pub struct ShardConfig {
@@ -39,6 +41,7 @@ struct ShardCore {
     store: Arc<RedbInMemoryInodeStore>,
     peer_endpoints: Arc<BTreeMap<ShardId, String>>,
     mailboxes: ReadResultMailboxRegistry,
+    client_results: TxResultRegistry,
 }
 
 pub struct BatchExecutionSummary {
@@ -62,6 +65,7 @@ impl ShardRuntime {
             store: Arc::new(RedbInMemoryInodeStore::new()?),
             peer_endpoints: Arc::new(config.peer_endpoints),
             mailboxes: ReadResultMailboxRegistry::new(),
+            client_results: TxResultRegistry::new(),
         });
         tokio::spawn(run_batch_executor(core.clone(), batch_rx));
         Ok(Self { core, batch_tx })
@@ -88,6 +92,10 @@ impl ShardRuntime {
 
     pub async fn route_local_read_result(&self, result: LocalReadResult) -> Result<()> {
         self.core.mailboxes.route(result).await
+    }
+
+    pub async fn get_tx_result(&self, tx_id: TxId) -> Result<ClientTxResult> {
+        self.core.client_results.wait(tx_id).await
     }
 
     pub fn dump_state(&self) -> Result<BTreeMap<Key, Inode>> {
@@ -123,6 +131,16 @@ async fn execute_batch_on_shard_inner(
 
     for tx in &batch.txs {
         validate_sets(tx)?;
+        let result_shard = core
+            .layout
+            .result_shard(tx)
+            .ok_or_else(|| Error::InvalidBatch(format!("tx {} has no result shard", tx.tx_id)))?;
+        if result_shard == core.shard_id {
+            core.client_results.ensure_pending(tx.tx_id).await;
+        } else {
+            core.client_results.mark_not_responsible(tx.tx_id).await;
+        }
+
         let local_keys = core.layout.local_lock_keys(tx, core.shard_id);
         if local_keys.is_empty() {
             continue;
@@ -148,6 +166,7 @@ async fn execute_batch_on_shard_inner(
             batch_id: batch.batch_id,
             tx: tx.clone(),
             participants,
+            result_shard,
             local_keys,
             grant_rx,
             remote_rx,
@@ -205,6 +224,7 @@ struct TxWorker {
     batch_id: BatchId,
     tx: OrderedTx,
     participants: Participants,
+    result_shard: ShardId,
     local_keys: BTreeSet<Key>,
     grant_rx: mpsc::Receiver<LockGrant>,
     remote_rx: Option<mpsc::Receiver<LocalReadResult>>,
@@ -255,15 +275,22 @@ impl TxWorker {
 
         let full_reads = self.collect_full_reads(local_reads).await?;
         let output = execute_deterministic(&self.tx, &full_reads);
+        let result = output.result;
         let local_writes =
             filter_local_writes(output.writes, self.core.shard_id, &self.core.layout);
         self.validate_local_writes(&local_writes)?;
         self.core.store.apply_writes_atomically(&local_writes)?;
+        if self.result_shard == self.core.shard_id {
+            self.core
+                .client_results
+                .mark_ready(self.tx.tx_id, result)
+                .await;
+        }
 
         Ok(WorkerCompletion::Active(TxResultRecord {
             tx_id: self.tx.tx_id,
             shard_id: self.core.shard_id,
-            result: output.result,
+            result,
         }))
     }
 
@@ -488,23 +515,105 @@ fn new_mailbox(capacity: usize) -> MailboxEntry {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClientTxResult {
+    Ready(TxResult),
+    NotResponsible,
+}
+
+#[derive(Clone)]
+pub struct TxResultRegistry {
+    inner: Arc<Mutex<BTreeMap<TxId, watch::Sender<ClientTxResultState>>>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClientTxResultState {
+    Pending,
+    Ready(TxResult),
+    NotResponsible,
+}
+
+impl TxResultRegistry {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+
+    pub async fn ensure_pending(&self, tx_id: TxId) {
+        let mut inner = self.inner.lock().await;
+        inner
+            .entry(tx_id)
+            .or_insert_with(|| new_result_sender(ClientTxResultState::Pending));
+    }
+
+    pub async fn mark_ready(&self, tx_id: TxId, result: TxResult) {
+        self.update(tx_id, ClientTxResultState::Ready(result)).await;
+    }
+
+    pub async fn mark_not_responsible(&self, tx_id: TxId) {
+        self.update(tx_id, ClientTxResultState::NotResponsible)
+            .await;
+    }
+
+    pub async fn wait(&self, tx_id: TxId) -> Result<ClientTxResult> {
+        let mut rx = {
+            let mut inner = self.inner.lock().await;
+            inner
+                .entry(tx_id)
+                .or_insert_with(|| new_result_sender(ClientTxResultState::Pending))
+                .subscribe()
+        };
+
+        loop {
+            match *rx.borrow() {
+                ClientTxResultState::Pending => {}
+                ClientTxResultState::Ready(result) => return Ok(ClientTxResult::Ready(result)),
+                ClientTxResultState::NotResponsible => return Ok(ClientTxResult::NotResponsible),
+            }
+            rx.changed().await.map_err(|_| {
+                Error::ChannelClosed(format!("tx result registry closed for tx {}", tx_id))
+            })?;
+        }
+    }
+
+    async fn update(&self, tx_id: TxId, state: ClientTxResultState) {
+        let sender = {
+            let mut inner = self.inner.lock().await;
+            inner
+                .entry(tx_id)
+                .or_insert_with(|| new_result_sender(ClientTxResultState::Pending))
+                .clone()
+        };
+        sender.send_replace(state);
+    }
+}
+
+fn new_result_sender(state: ClientTxResultState) -> watch::Sender<ClientTxResultState> {
+    let (sender, _) = watch::channel(state);
+    sender
+}
+
 #[derive(Clone, Debug)]
 pub struct SequencerConfig {
     pub node_id: String,
     pub shard_count: u64,
     pub shard_endpoints: BTreeMap<ShardId, String>,
     pub max_batch_size: usize,
+    pub batch_flush_interval: Duration,
+}
+
+impl SequencerConfig {
+    pub fn default_batch_flush_interval() -> Duration {
+        DEFAULT_BATCH_FLUSH_INTERVAL
+    }
 }
 
 pub struct SequencerRuntime {
     node_id: String,
     layout: ShardLayout,
-    shard_endpoints: Arc<BTreeMap<ShardId, String>>,
-    max_batch_size: usize,
-    next_batch_id: AtomicU64,
-    next_tx_id: AtomicU64,
-    submit_lock: Mutex<()>,
-    batch_log: Mutex<Vec<Batch>>,
+    command_tx: mpsc::Sender<SequencerCommand>,
+    batch_log: Arc<Mutex<Vec<Batch>>>,
 }
 
 pub struct SubmitBatchSummary {
@@ -513,17 +622,41 @@ pub struct SubmitBatchSummary {
     pub tx_results: Vec<TxResultRecord>,
 }
 
+pub struct SubmitTxAck {
+    pub tx_id: TxId,
+    pub result_shard: ShardId,
+}
+
 impl SequencerRuntime {
     pub fn new(config: SequencerConfig) -> Self {
+        let layout = ShardLayout::new(config.shard_count);
+        let shard_endpoints = Arc::new(config.shard_endpoints);
+        let batch_log = Arc::new(Mutex::new(Vec::new()));
+        let (command_tx, command_rx) = mpsc::channel(SEQUENCER_COMMAND_CAPACITY);
+        let (dispatch_tx, dispatch_rx) = mpsc::channel(BATCH_QUEUE_CAPACITY);
+
+        tokio::spawn(run_batch_dispatcher(
+            shard_endpoints,
+            dispatch_rx,
+            batch_log.clone(),
+        ));
+        tokio::spawn(run_sequencer_actor(SequencerActor {
+            layout: layout.clone(),
+            max_batch_size: config.max_batch_size,
+            batch_flush_interval: config.batch_flush_interval,
+            next_batch_id: 1,
+            next_tx_id: 1,
+            open_batch: None,
+            command_tx: command_tx.clone(),
+            command_rx,
+            dispatch_tx,
+        }));
+
         Self {
             node_id: config.node_id,
-            layout: ShardLayout::new(config.shard_count),
-            shard_endpoints: Arc::new(config.shard_endpoints),
-            max_batch_size: config.max_batch_size,
-            next_batch_id: AtomicU64::new(1),
-            next_tx_id: AtomicU64::new(1),
-            submit_lock: Mutex::new(()),
-            batch_log: Mutex::new(Vec::new()),
+            layout,
+            command_tx,
+            batch_log,
         }
     }
 
@@ -531,21 +664,163 @@ impl SequencerRuntime {
         &self.node_id
     }
 
+    pub async fn submit_tx(&self, op: FsOp) -> Result<SubmitTxAck> {
+        let (reply, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(SequencerCommand::SubmitTx { op, reply })
+            .await
+            .map_err(|_| Error::ChannelClosed("sequencer actor is closed".to_string()))?;
+        response_rx.await.map_err(|_| {
+            Error::ChannelClosed("sequencer SubmitTx response channel is closed".to_string())
+        })?
+    }
+
     pub async fn submit_ops(&self, ops: Vec<FsOp>) -> Result<SubmitBatchSummary> {
-        let _guard = self.submit_lock.lock().await;
-        if ops.len() > self.max_batch_size {
-            return Err(Error::BatchTooLarge {
-                size: ops.len(),
-                max: self.max_batch_size,
+        let (reply, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(SequencerCommand::SubmitBatch { ops, reply })
+            .await
+            .map_err(|_| Error::ChannelClosed("sequencer actor is closed".to_string()))?;
+        response_rx.await.map_err(|_| {
+            Error::ChannelClosed("sequencer SubmitBatch response channel is closed".to_string())
+        })?
+    }
+
+    pub async fn batch_log(&self) -> Vec<Batch> {
+        self.batch_log.lock().await.clone()
+    }
+
+    pub fn layout(&self) -> &ShardLayout {
+        &self.layout
+    }
+}
+
+enum SequencerCommand {
+    SubmitTx {
+        op: FsOp,
+        reply: oneshot::Sender<Result<SubmitTxAck>>,
+    },
+    SubmitBatch {
+        ops: Vec<FsOp>,
+        reply: oneshot::Sender<Result<SubmitBatchSummary>>,
+    },
+    FlushOpen {
+        batch_id: BatchId,
+    },
+}
+
+struct SequencerActor {
+    layout: ShardLayout,
+    max_batch_size: usize,
+    batch_flush_interval: Duration,
+    next_batch_id: BatchId,
+    next_tx_id: TxId,
+    open_batch: Option<OpenBatch>,
+    command_tx: mpsc::Sender<SequencerCommand>,
+    command_rx: mpsc::Receiver<SequencerCommand>,
+    dispatch_tx: mpsc::Sender<DispatchBatchJob>,
+}
+
+struct OpenBatch {
+    batch_id: BatchId,
+    txs: Vec<OrderedTx>,
+    tx_ids: Vec<TxId>,
+}
+
+struct DispatchBatchJob {
+    batch: Batch,
+    tx_ids: Vec<TxId>,
+    reply: Option<oneshot::Sender<Result<SubmitBatchSummary>>>,
+}
+
+async fn run_sequencer_actor(mut actor: SequencerActor) {
+    while let Some(command) = actor.command_rx.recv().await {
+        match command {
+            SequencerCommand::SubmitTx { op, reply } => {
+                let response = actor.handle_submit_tx(op).await;
+                let _ = reply.send(response);
+            }
+            SequencerCommand::SubmitBatch { ops, reply } => {
+                actor.handle_submit_batch(ops, reply).await;
+            }
+            SequencerCommand::FlushOpen { batch_id } => {
+                if actor
+                    .open_batch
+                    .as_ref()
+                    .is_some_and(|open| open.batch_id == batch_id)
+                {
+                    let _ = actor.seal_open_batch().await;
+                }
+            }
+        }
+    }
+}
+
+impl SequencerActor {
+    async fn handle_submit_tx(&mut self, op: FsOp) -> Result<SubmitTxAck> {
+        let tx_id = self.next_tx_id;
+        let (read_set, write_set) = derive_read_write_set(&op)?;
+        let result_shard = self
+            .layout
+            .result_shard_for_sets(&read_set, &write_set)
+            .ok_or_else(|| Error::InvalidBatch(format!("tx {} has no result shard", tx_id)))?;
+        let max_batch_size = self.max_batch_size;
+        let should_flush = {
+            let batch = self.ensure_open_batch();
+            let batch_index = batch.txs.len() as u32;
+            batch.tx_ids.push(tx_id);
+            batch.txs.push(OrderedTx {
+                tx_id,
+                batch_index,
+                op,
+                read_set,
+                write_set,
             });
+            batch.txs.len() >= max_batch_size
+        };
+        self.next_tx_id += 1;
+
+        if should_flush {
+            self.seal_open_batch().await?;
         }
 
-        let batch_id = self.next_batch_id.fetch_add(1, Ordering::SeqCst);
+        Ok(SubmitTxAck {
+            tx_id,
+            result_shard,
+        })
+    }
+
+    async fn handle_submit_batch(
+        &mut self,
+        ops: Vec<FsOp>,
+        reply: oneshot::Sender<Result<SubmitBatchSummary>>,
+    ) {
+        if ops.len() > self.max_batch_size {
+            let _ = reply.send(Err(Error::BatchTooLarge {
+                size: ops.len(),
+                max: self.max_batch_size,
+            }));
+            return;
+        }
+
+        if let Err(err) = self.seal_open_batch().await {
+            let _ = reply.send(Err(err));
+            return;
+        }
+
+        let batch_id = self.take_next_batch_id();
         let mut txs = Vec::with_capacity(ops.len());
         let mut tx_ids = Vec::with_capacity(ops.len());
         for (batch_index, op) in ops.into_iter().enumerate() {
-            let tx_id = self.next_tx_id.fetch_add(1, Ordering::SeqCst);
-            let (read_set, write_set) = derive_read_write_set(&op)?;
+            let tx_id = self.next_tx_id;
+            self.next_tx_id += 1;
+            let (read_set, write_set) = match derive_read_write_set(&op) {
+                Ok(sets) => sets,
+                Err(err) => {
+                    let _ = reply.send(Err(err));
+                    return;
+                }
+            };
             tx_ids.push(tx_id);
             txs.push(OrderedTx {
                 tx_id,
@@ -557,54 +832,127 @@ impl SequencerRuntime {
         }
 
         let batch = Batch { batch_id, txs };
-        let tx_results = self.send_batch_to_all_shards(&batch).await?;
-        self.batch_log.lock().await.push(batch);
-
-        Ok(SubmitBatchSummary {
-            batch_id,
-            tx_ids,
-            tx_results,
-        })
-    }
-
-    pub async fn batch_log(&self) -> Vec<Batch> {
-        self.batch_log.lock().await.clone()
-    }
-
-    pub fn layout(&self) -> &ShardLayout {
-        &self.layout
-    }
-
-    async fn send_batch_to_all_shards(&self, batch: &Batch) -> Result<Vec<TxResultRecord>> {
-        let proto_batch = batch_to_proto(batch);
-        let mut handles = Vec::new();
-        for endpoint in self.shard_endpoints.values() {
-            let endpoint = endpoint.clone();
-            let request_batch = proto_batch.clone();
-            handles.push(tokio::spawn(async move {
-                let mut client = pb::shard_client::ShardClient::connect(endpoint).await?;
-                let response = client
-                    .execute_batch(pb::ExecuteBatchRequest {
-                        batch: Some(request_batch),
-                    })
-                    .await?
-                    .into_inner();
-                let mut records = Vec::with_capacity(response.tx_results.len());
-                for record in response.tx_results {
-                    records.push(crate::convert::tx_result_record_from_proto(record)?);
-                }
-                Ok::<_, Error>(records)
-            }));
+        if let Err(err) = self.dispatch_batch(batch, tx_ids, Some(reply)).await {
+            // The dispatch queue is closed, so there is no receiver left that can observe
+            // this batch. The original reply has been dropped with the failed job.
+            tracing::error!("failed to dispatch SubmitBatch: {err}");
         }
-
-        let mut all_results = Vec::new();
-        for handle in handles {
-            let records = handle
-                .await
-                .map_err(|err| Error::TaskJoin(err.to_string()))??;
-            all_results.extend(records);
-        }
-        all_results.sort_by_key(|record| (record.tx_id, record.shard_id));
-        Ok(all_results)
     }
+
+    fn ensure_open_batch(&mut self) -> &mut OpenBatch {
+        if self.open_batch.is_none() {
+            let batch_id = self.take_next_batch_id();
+            self.spawn_flush_timer(batch_id);
+            self.open_batch = Some(OpenBatch {
+                batch_id,
+                txs: Vec::new(),
+                tx_ids: Vec::new(),
+            });
+        }
+        self.open_batch.as_mut().expect("open batch exists")
+    }
+
+    async fn seal_open_batch(&mut self) -> Result<()> {
+        let Some(open) = self.open_batch.take() else {
+            return Ok(());
+        };
+        if open.txs.is_empty() {
+            return Ok(());
+        }
+        let batch = Batch {
+            batch_id: open.batch_id,
+            txs: open.txs,
+        };
+        self.dispatch_batch(batch, open.tx_ids, None).await
+    }
+
+    async fn dispatch_batch(
+        &self,
+        batch: Batch,
+        tx_ids: Vec<TxId>,
+        reply: Option<oneshot::Sender<Result<SubmitBatchSummary>>>,
+    ) -> Result<()> {
+        self.dispatch_tx
+            .send(DispatchBatchJob {
+                batch,
+                tx_ids,
+                reply,
+            })
+            .await
+            .map_err(|_| Error::ChannelClosed("sequencer dispatch queue is closed".to_string()))
+    }
+
+    fn spawn_flush_timer(&self, batch_id: BatchId) {
+        let command_tx = self.command_tx.clone();
+        let interval = self.batch_flush_interval;
+        tokio::spawn(async move {
+            tokio::time::sleep(interval).await;
+            let _ = command_tx
+                .send(SequencerCommand::FlushOpen { batch_id })
+                .await;
+        });
+    }
+
+    fn take_next_batch_id(&mut self) -> BatchId {
+        let batch_id = self.next_batch_id;
+        self.next_batch_id += 1;
+        batch_id
+    }
+}
+
+async fn run_batch_dispatcher(
+    shard_endpoints: Arc<BTreeMap<ShardId, String>>,
+    mut dispatch_rx: mpsc::Receiver<DispatchBatchJob>,
+    batch_log: Arc<Mutex<Vec<Batch>>>,
+) {
+    while let Some(job) = dispatch_rx.recv().await {
+        let result = send_batch_to_all_shards(shard_endpoints.clone(), &job.batch).await;
+        if result.is_ok() {
+            batch_log.lock().await.push(job.batch.clone());
+        }
+        if let Some(reply) = job.reply {
+            let response = result.map(|tx_results| SubmitBatchSummary {
+                batch_id: job.batch.batch_id,
+                tx_ids: job.tx_ids,
+                tx_results,
+            });
+            let _ = reply.send(response);
+        }
+    }
+}
+
+async fn send_batch_to_all_shards(
+    shard_endpoints: Arc<BTreeMap<ShardId, String>>,
+    batch: &Batch,
+) -> Result<Vec<TxResultRecord>> {
+    let proto_batch = batch_to_proto(batch);
+    let mut handles = Vec::new();
+    for endpoint in shard_endpoints.values() {
+        let endpoint = endpoint.clone();
+        let request_batch = proto_batch.clone();
+        handles.push(tokio::spawn(async move {
+            let mut client = pb::shard_client::ShardClient::connect(endpoint).await?;
+            let response = client
+                .execute_batch(pb::ExecuteBatchRequest {
+                    batch: Some(request_batch),
+                })
+                .await?
+                .into_inner();
+            let mut records = Vec::with_capacity(response.tx_results.len());
+            for record in response.tx_results {
+                records.push(crate::convert::tx_result_record_from_proto(record)?);
+            }
+            Ok::<_, Error>(records)
+        }));
+    }
+
+    let mut all_results = Vec::new();
+    for handle in handles {
+        let records = handle
+            .await
+            .map_err(|err| Error::TaskJoin(err.to_string()))??;
+        all_results.extend(records);
+    }
+    all_results.sort_by_key(|record| (record.tx_id, record.shard_id));
+    Ok(all_results)
 }

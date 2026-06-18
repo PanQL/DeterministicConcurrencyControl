@@ -6,11 +6,13 @@ service Shard {
   rpc Ping(PingRequest) returns (PingResponse);
   rpc ExecuteBatch(ExecuteBatchRequest) returns (ExecuteBatchResponse);
   rpc LocalReadResult(LocalReadResultRequest) returns (LocalReadResultResponse);
+  rpc GetTxResult(GetTxResultRequest) returns (GetTxResultResponse);
   rpc DumpState(DumpStateRequest) returns (DumpStateResponse);
 }
 
 service Sequencer {
   rpc Ping(PingRequest) returns (PingResponse);
+  rpc SubmitTx(SubmitTxRequest) returns (SubmitTxResponse);
   rpc SubmitBatch(SubmitBatchRequest) returns (SubmitBatchResponse);
 }
 
@@ -39,6 +41,17 @@ message LocalReadResultRequest {
 }
 
 message LocalReadResultResponse {}
+
+message GetTxResultRequest {
+  uint64 tx_id = 1;
+}
+
+message GetTxResultResponse {
+  uint64 tx_id = 1;
+  uint64 shard_id = 2;
+  TxResultStatus status = 3;
+  TxResult result = 4;
+}
 
 message DumpStateRequest {}
 
@@ -131,10 +144,25 @@ enum TxResult {
   TX_RESULT_INVALID = 6;
 }
 
+enum TxResultStatus {
+  TX_RESULT_STATUS_UNSPECIFIED = 0;
+  TX_RESULT_STATUS_READY = 1;
+  TX_RESULT_STATUS_NOT_RESPONSIBLE = 2;
+}
+
 message TxResultRecord {
   uint64 tx_id = 1;
   uint64 shard_id = 2;
   TxResult result = 3;
+}
+
+message SubmitTxRequest {
+  FsOp op = 1;
+}
+
+message SubmitTxResponse {
+  uint64 tx_id = 1;
+  uint64 result_shard = 2;
 }
 
 message SubmitBatchRequest {

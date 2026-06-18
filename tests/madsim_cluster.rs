@@ -6,7 +6,7 @@ use calvinfs_demo::checker::{
     reference_execute_batches,
 };
 use calvinfs_demo::convert::{
-    fs_op_to_proto, inode_entries_from_proto, tx_result_records_from_proto,
+    fs_op_to_proto, inode_entries_from_proto, tx_result_from_i32, tx_result_records_from_proto,
 };
 use calvinfs_demo::engine::{SequencerConfig, SequencerRuntime, ShardConfig, ShardRuntime};
 use calvinfs_demo::executor::derive_read_write_set;
@@ -24,6 +24,8 @@ use tonic::transport::Server;
 const SHARD_COUNT: u64 = 4;
 const BATCH_COUNT: usize = 16;
 const BATCH_SIZE: usize = 512;
+const PARALLEL_CLIENT_COUNT: usize = 16;
+const CREATES_PER_PARALLEL_CLIENT: usize = BATCH_SIZE;
 const SHARD_PORT: u16 = 50_051;
 const SEQUENCER_PORT: u16 = 50_052;
 
@@ -52,6 +54,71 @@ async fn four_shards_full_metadata_workload() -> Result<()> {
         .spawn(run_driver(sequencer_endpoint, shard_endpoints))
         .await
         .expect("driver task panicked")?;
+
+    Ok(())
+}
+
+#[madsim::test]
+async fn submit_tx_get_result_client_api() -> Result<()> {
+    let mut shard_endpoints = BTreeMap::new();
+    for shard_id in 0..SHARD_COUNT {
+        let ip = shard_ip(shard_id);
+        shard_endpoints.insert(shard_id, endpoint(ip, SHARD_PORT));
+    }
+    for shard_id in 0..SHARD_COUNT {
+        let ip = shard_ip(shard_id);
+        start_shard_node(shard_id, ip, shard_endpoints.clone());
+    }
+
+    let sequencer_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 100));
+    let sequencer_endpoint = endpoint(sequencer_ip, SEQUENCER_PORT);
+    start_sequencer_node(sequencer_ip, shard_endpoints.clone());
+
+    let driver = madsim::runtime::Handle::current()
+        .create_node()
+        .name("submit-tx-driver")
+        .ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 201)))
+        .build();
+    driver
+        .spawn(run_submit_tx_driver(sequencer_endpoint, shard_endpoints))
+        .await
+        .expect("submit tx driver task panicked")?;
+
+    Ok(())
+}
+
+#[madsim::test]
+async fn submit_tx_parallel_clients_create_full_batches() -> Result<()> {
+    let mut shard_endpoints = BTreeMap::new();
+    for shard_id in 0..SHARD_COUNT {
+        let ip = shard_ip(shard_id);
+        shard_endpoints.insert(shard_id, endpoint(ip, SHARD_PORT));
+    }
+    for shard_id in 0..SHARD_COUNT {
+        let ip = shard_ip(shard_id);
+        start_shard_node(shard_id, ip, shard_endpoints.clone());
+    }
+
+    let sequencer_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 100));
+    let sequencer_endpoint = endpoint(sequencer_ip, SEQUENCER_PORT);
+    start_sequencer_node_with_flush_interval(
+        sequencer_ip,
+        shard_endpoints.clone(),
+        Duration::from_secs(60),
+    );
+
+    let driver = madsim::runtime::Handle::current()
+        .create_node()
+        .name("parallel-submit-tx-driver")
+        .ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 202)))
+        .build();
+    driver
+        .spawn(run_parallel_submit_tx_driver(
+            sequencer_endpoint,
+            shard_endpoints,
+        ))
+        .await
+        .expect("parallel submit tx driver task panicked")?;
 
     Ok(())
 }
@@ -119,6 +186,314 @@ async fn run_driver(
     assert_state_matches(&expected, &actual)?;
     assert_tx_results_consistent(&layout, &reference_batches, &all_records)?;
 
+    Ok(())
+}
+
+async fn run_submit_tx_driver(
+    sequencer_endpoint: String,
+    shard_endpoints: BTreeMap<ShardId, String>,
+) -> Result<()> {
+    wait_for_shards(&shard_endpoints).await?;
+    wait_for_sequencer(&sequencer_endpoint).await?;
+
+    let expected_ops = vec![
+        expect("submit_tx:mkdir_root", mkdir("/")?, TxResult::Ok),
+        expect("submit_tx:mkdir_client", mkdir("/client")?, TxResult::Ok),
+        expect(
+            "submit_tx:create_file",
+            create("/client/file")?,
+            TxResult::Ok,
+        ),
+        expect("submit_tx:stat_file", stat("/client/file")?, TxResult::Ok),
+        expect(
+            "submit_tx:create_duplicate",
+            create("/client/file")?,
+            TxResult::AlreadyExists,
+        ),
+        expect(
+            "submit_tx:unlink_file",
+            unlink("/client/file")?,
+            TxResult::Ok,
+        ),
+        expect("submit_tx:rmdir_client", rmdir("/client")?, TxResult::Ok),
+        expect("submit_tx:final_stat_root", stat("/")?, TxResult::Ok),
+    ];
+
+    let layout = ShardLayout::new(SHARD_COUNT);
+    let mut sequencer = pb::sequencer_client::SequencerClient::connect(sequencer_endpoint).await?;
+    let mut tx_ids = Vec::with_capacity(expected_ops.len());
+    let mut ops = Vec::with_capacity(expected_ops.len());
+
+    for (index, expected) in expected_ops.iter().enumerate() {
+        let response = sequencer
+            .submit_tx(pb::SubmitTxRequest {
+                op: Some(fs_op_to_proto(&expected.op)),
+            })
+            .await?
+            .into_inner();
+        let expected_tx_id = index as u64 + 1;
+        if response.tx_id != expected_tx_id {
+            bail!(
+                "expected tx_id {}, got {} for {}",
+                expected_tx_id,
+                response.tx_id,
+                expected.label
+            );
+        }
+
+        let (read_set, write_set) = derive_read_write_set(&expected.op)?;
+        let expected_result_shard = layout
+            .result_shard_for_sets(&read_set, &write_set)
+            .expect("test transaction has a result shard");
+        if response.result_shard != expected_result_shard {
+            bail!(
+                "tx {} ({}) expected result_shard {}, got {}",
+                response.tx_id,
+                expected.label,
+                expected_result_shard,
+                response.result_shard
+            );
+        }
+        if matches!(expected.op, FsOp::Stat { .. }) {
+            let coordinator = layout
+                .read_only_coordinator(&read_set)
+                .expect("stat read set has coordinator");
+            if response.result_shard != coordinator {
+                bail!(
+                    "read-only tx {} expected coordinator {}, got {}",
+                    response.tx_id,
+                    coordinator,
+                    response.result_shard
+                );
+            }
+        }
+
+        let mut shard =
+            pb::shard_client::ShardClient::connect(shard_endpoints[&response.result_shard].clone())
+                .await?;
+        let result = shard
+            .get_tx_result(pb::GetTxResultRequest {
+                tx_id: response.tx_id,
+            })
+            .await?
+            .into_inner();
+        assert_ready_result(&expected.label, &result, expected.expected)?;
+
+        let non_result_shard = (response.result_shard + 1) % SHARD_COUNT;
+        let mut non_result_client =
+            pb::shard_client::ShardClient::connect(shard_endpoints[&non_result_shard].clone())
+                .await?;
+        let non_result = non_result_client
+            .get_tx_result(pb::GetTxResultRequest {
+                tx_id: response.tx_id,
+            })
+            .await?
+            .into_inner();
+        if non_result.status != pb::TxResultStatus::NotResponsible as i32 {
+            bail!(
+                "tx {} ({}) expected NOT_RESPONSIBLE from shard {}, got status {}",
+                response.tx_id,
+                expected.label,
+                non_result_shard,
+                non_result.status
+            );
+        }
+
+        tx_ids.push(response.tx_id);
+        ops.push(expected.op.clone());
+    }
+
+    let mut shard_states = Vec::new();
+    for (shard_id, endpoint) in &shard_endpoints {
+        let mut client = pb::shard_client::ShardClient::connect(endpoint.clone()).await?;
+        let response = client
+            .dump_state(pb::DumpStateRequest {})
+            .await?
+            .into_inner();
+        shard_states.push((*shard_id, inode_entries_from_proto(response.entries)?));
+    }
+
+    let reference_batches = vec![reference_batch(1, tx_ids, ops)?];
+    let expected = reference_execute_batches(&reference_batches);
+    let actual = merge_shard_states(&layout, shard_states)?;
+    assert_state_matches(&expected, &actual)?;
+
+    Ok(())
+}
+
+async fn run_parallel_submit_tx_driver(
+    sequencer_endpoint: String,
+    shard_endpoints: BTreeMap<ShardId, String>,
+) -> Result<()> {
+    wait_for_shards(&shard_endpoints).await?;
+    wait_for_sequencer(&sequencer_endpoint).await?;
+
+    let layout = ShardLayout::new(SHARD_COUNT);
+    let mut sequencer =
+        pb::sequencer_client::SequencerClient::connect(sequencer_endpoint.clone()).await?;
+    let mut reference_batches = Vec::new();
+    let mut all_records = Vec::new();
+
+    submit_expected_batch(
+        &mut sequencer,
+        vec![
+            expect("parallel_setup:mkdir_root", mkdir("/")?, TxResult::Ok),
+            expect(
+                "parallel_setup:mkdir_parallel",
+                mkdir("/parallel")?,
+                TxResult::Ok,
+            ),
+        ],
+        &mut reference_batches,
+        &mut all_records,
+    )
+    .await?;
+
+    let mut handles = Vec::new();
+    for client_id in 0..PARALLEL_CLIENT_COUNT {
+        let endpoint = sequencer_endpoint.clone();
+        handles.push(tokio::spawn(async move {
+            let mut client = pb::sequencer_client::SequencerClient::connect(endpoint).await?;
+            let mut submitted = Vec::with_capacity(CREATES_PER_PARALLEL_CLIENT);
+            for file_id in 0..CREATES_PER_PARALLEL_CLIENT {
+                let label = format!("parallel_client:{client_id}:{file_id}");
+                let op = create(&format!("/parallel/client_{client_id}_file_{file_id}"))?;
+                let response = client
+                    .submit_tx(pb::SubmitTxRequest {
+                        op: Some(fs_op_to_proto(&op)),
+                    })
+                    .await?
+                    .into_inner();
+                submitted.push(SubmittedClientTx {
+                    label,
+                    op,
+                    expected: TxResult::Ok,
+                    tx_id: response.tx_id,
+                    result_shard: response.result_shard,
+                });
+            }
+            Ok::<_, anyhow::Error>(submitted)
+        }));
+    }
+
+    let mut submitted = Vec::with_capacity(PARALLEL_CLIENT_COUNT * CREATES_PER_PARALLEL_CLIENT);
+    for handle in handles {
+        submitted.extend(handle.await.expect("parallel client task panicked")?);
+    }
+    submitted.sort_by_key(|tx| tx.tx_id);
+
+    let expected_parallel_count = PARALLEL_CLIENT_COUNT * CREATES_PER_PARALLEL_CLIENT;
+    assert_eq!(submitted.len(), expected_parallel_count);
+    assert_eq!(expected_parallel_count % BATCH_SIZE, 0);
+
+    let first_parallel_tx = reference_batches
+        .last()
+        .and_then(|batch| batch.txs.last())
+        .map(|tx| tx.tx_id + 1)
+        .expect("setup batch contains transactions");
+    for (index, tx) in submitted.iter().enumerate() {
+        let expected_tx_id = first_parallel_tx + index as u64;
+        if tx.tx_id != expected_tx_id {
+            bail!(
+                "{} expected tx_id {}, got {}",
+                tx.label,
+                expected_tx_id,
+                tx.tx_id
+            );
+        }
+        let (read_set, write_set) = derive_read_write_set(&tx.op)?;
+        let expected_result_shard = layout
+            .result_shard_for_sets(&read_set, &write_set)
+            .expect("parallel create has a result shard");
+        if tx.result_shard != expected_result_shard {
+            bail!(
+                "{} expected result_shard {}, got {}",
+                tx.label,
+                expected_result_shard,
+                tx.result_shard
+            );
+        }
+    }
+
+    for tx in &submitted {
+        let mut shard =
+            pb::shard_client::ShardClient::connect(shard_endpoints[&tx.result_shard].clone())
+                .await?;
+        let result = shard
+            .get_tx_result(pb::GetTxResultRequest { tx_id: tx.tx_id })
+            .await?
+            .into_inner();
+        assert_ready_result(&tx.label, &result, tx.expected)?;
+    }
+
+    for (batch_index, chunk) in submitted.chunks(BATCH_SIZE).enumerate() {
+        let batch_id = 2 + batch_index as u64;
+        let tx_ids = chunk.iter().map(|tx| tx.tx_id).collect();
+        let ops = chunk.iter().map(|tx| tx.op.clone()).collect();
+        reference_batches.push(reference_batch(batch_id, tx_ids, ops)?);
+    }
+
+    submit_expected_batch(
+        &mut sequencer,
+        vec![expect(
+            "parallel_barrier:stat_root",
+            stat("/")?,
+            TxResult::Ok,
+        )],
+        &mut reference_batches,
+        &mut all_records,
+    )
+    .await?;
+
+    let mut shard_states = Vec::new();
+    for (shard_id, endpoint) in &shard_endpoints {
+        let mut client = pb::shard_client::ShardClient::connect(endpoint.clone()).await?;
+        let response = client
+            .dump_state(pb::DumpStateRequest {})
+            .await?
+            .into_inner();
+        shard_states.push((*shard_id, inode_entries_from_proto(response.entries)?));
+    }
+
+    let expected = reference_execute_batches(&reference_batches);
+    let actual = merge_shard_states(&layout, shard_states)?;
+    assert_state_matches(&expected, &actual)?;
+
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct SubmittedClientTx {
+    label: String,
+    op: FsOp,
+    expected: TxResult,
+    tx_id: u64,
+    result_shard: ShardId,
+}
+
+fn assert_ready_result(
+    label: &str,
+    response: &pb::GetTxResultResponse,
+    expected: TxResult,
+) -> Result<()> {
+    if response.status != pb::TxResultStatus::Ready as i32 {
+        bail!(
+            "tx {} ({}) expected READY, got status {}",
+            response.tx_id,
+            label,
+            response.status
+        );
+    }
+    let actual = tx_result_from_i32(response.result)?;
+    if actual != expected {
+        bail!(
+            "tx {} ({}) expected {:?}, got {:?}",
+            response.tx_id,
+            label,
+            expected,
+            actual
+        );
+    }
     Ok(())
 }
 
@@ -560,6 +935,18 @@ fn start_shard_node(shard_id: ShardId, ip: IpAddr, peer_endpoints: BTreeMap<Shar
 }
 
 fn start_sequencer_node(ip: IpAddr, shard_endpoints: BTreeMap<ShardId, String>) {
+    start_sequencer_node_with_flush_interval(
+        ip,
+        shard_endpoints,
+        SequencerConfig::default_batch_flush_interval(),
+    );
+}
+
+fn start_sequencer_node_with_flush_interval(
+    ip: IpAddr,
+    shard_endpoints: BTreeMap<ShardId, String>,
+    batch_flush_interval: Duration,
+) {
     let node = madsim::runtime::Handle::current()
         .create_node()
         .name("sequencer")
@@ -571,6 +958,7 @@ fn start_sequencer_node(ip: IpAddr, shard_endpoints: BTreeMap<ShardId, String>) 
             shard_count: SHARD_COUNT,
             shard_endpoints,
             max_batch_size: BATCH_SIZE,
+            batch_flush_interval,
         }));
         let addr = SocketAddr::new(ip, SEQUENCER_PORT);
         Server::builder()

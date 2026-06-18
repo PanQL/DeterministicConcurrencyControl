@@ -57,6 +57,22 @@ impl ShardLayout {
         self.participants_for_sets(&tx.read_set, &tx.write_set)
     }
 
+    pub fn result_shard_for_sets(
+        &self,
+        read_set: &BTreeSet<Key>,
+        write_set: &BTreeSet<Key>,
+    ) -> Option<ShardId> {
+        self.participants_for_sets(read_set, write_set)
+            .active
+            .iter()
+            .next()
+            .copied()
+    }
+
+    pub fn result_shard(&self, tx: &OrderedTx) -> Option<ShardId> {
+        self.result_shard_for_sets(&tx.read_set, &tx.write_set)
+    }
+
     pub fn read_only_coordinator(&self, read_set: &BTreeSet<Key>) -> Option<ShardId> {
         read_set.iter().next().map(|key| self.shard_for_key(key))
     }

@@ -1,6 +1,6 @@
 # CalvinFS Metadata Transaction Demo Design
 
-状态：Draft v1，Milestone 1 设计选择已收敛，可进入实现。
+状态：Draft v2，Milestone 1 batch execution core 已实现，Milestone 2 增加 client-facing 单事务 API。
 
 本文档描述一个基于 Rust、tokio、tonic 和 madsim 的纯内存 CalvinFS-style metadata execution engine。目标是在 madsim 模拟环境中验证 Calvin-style metadata transaction 的核心正确性：Sequencer 生成事务 batch、所有 shard 按 batch 内确定性并发控制执行、跨分片读结果交换、active participant 执行一致性，以及最终分片状态与串行参考执行一致。
 
@@ -11,7 +11,7 @@
 - 业务代码直接写成普通 tokio/tonic 服务。
 - simulation build 中由 madsim 替换 tokio/tonic runtime 和 network。
 - test harness 在 madsim 中启动一个 Sequencer tonic server 和多个 shard tonic server。
-- test driver 向 Sequencer 提交一批 FsOp，由 Sequencer 生成一个 batch 并发送给所有 shards。
+- test driver 可通过内部 `SubmitBatch` 提交一批 FsOp；client-facing API 使用 `SubmitTx` 提交单个事务。
 - shard 对 Sequencer 内部 batch log 无感知，只按收到的 batch 内顺序做 deterministic local locking。
 - passive participant 通过 RPC 向 active participants 转发 local read result。
 - active participants 收齐 full read set 后执行同一份 deterministic transaction logic。
@@ -68,11 +68,13 @@ Calvin 论文中的 sequencing layer 会把输入事务组织成 batch/epoch，s
 
 本 demo 做一个更简单的单 Sequencer 版本：
 
-- Sequencer 接收一批 `FsOp`，生成一个 `Batch`。
+- client-facing API 是 `Sequencer.SubmitTx(FsOp)`，Sequencer 内部把在线请求组织成 `Batch`。
+- `Sequencer.SubmitBatch` 保留为集成测试/内部 API，不作为 client-facing API。
 - Sequencer 将同一个 `Batch` 发送给所有 shards。
 - shard 不保存、也不感知 Sequencer 内部 batch log。
 - shard 只知道当前 batch 的 ordered transactions，并在 batch 内做 deterministic concurrency control。
 - Sequencer 等待所有 shards 报告该 batch 完成后，才发送下一个 batch。
+- open batch 通过 `max_batch_size` 或 `batch_flush_interval` 双条件关闭，低负载时未满 batch 也会发送给 shards。
 - Sequencer 内部可以保留 batch log，供 checker 和 debug 使用；这是测试辅助状态，不是 shard 执行协议的一部分。
 - 初始 root directory 由第一个 batch 显式创建，测试不预装隐藏状态。
 
@@ -418,6 +420,7 @@ pub struct ShardRuntime {
     pub peers: BTreeMap<ShardId, String>,
     pub batch_tx: mpsc::Sender<BatchJob>,
     pub read_result_mailboxes: Arc<Mutex<ReadResultMailboxRegistry>>,
+    pub client_results: TxResultRegistry,
 }
 
 pub struct ReadResultMailboxRegistry {
@@ -440,6 +443,16 @@ pub struct BatchExecutionState {
     pub lock_table: LockTable,
     pub tx_results: BTreeMap<TxId, TxResult>,
 }
+
+pub struct TxResultRegistry {
+    pub results: BTreeMap<TxId, watch::Sender<ClientTxResultState>>,
+}
+
+pub enum ClientTxResultState {
+    Pending,
+    Ready(TxResult),
+    NotResponsible,
+}
 ```
 
 职责：
@@ -454,34 +467,57 @@ pub struct BatchExecutionState {
 - active worker 收齐 full read set 后执行 deterministic logic。
 - active worker 过滤并应用本 shard local writes。
 - 记录 tx result。
+- 若本 shard 是该 tx 的 client-facing `result_shard`，将 `TxResultRegistry` 中的状态更新为 `Ready(result)`，唤醒正在等待的 `GetTxResult` RPC。
+- 对非 `result_shard` 的 tx，更新为 `NotResponsible`，避免误查该 shard 的 client 长时间等待。
 - batch 内本 shard 相关事务全部完成后，向 Sequencer 返回 batch 完成结果。
+- 提供 blocking `GetTxResult` 供 client 获取事务结果。
 - 提供 DumpState 供测试使用。
 
 ### 3.7 `sequencer`
 
-第一阶段即实现 tonic Sequencer service。简化点是：Sequencer 不做流式在线调度，而是每次接收一批 `FsOp`，生成一个 ordered batch，发送给所有 shards，并等待所有 shards 报告该 batch 完成后再发送下一个 batch。
+Sequencer 是 client-facing 提交入口。Milestone 1 的 `SubmitBatch` 保留为集成测试/内部 API；Milestone 2 增加真正面向 client 的 `SubmitTx`。
 
 职责：
 
-- 接收 test driver 或 client 提交的 `FsOp` batch。
+- 接收 client 提交的单个 `FsOp`。
+- 使用单 actor 管理在线提交、open batch、flush timer 和 dispatch queue。
+- `SubmitTx` RPC handler 通过 `oneshot` reply channel 等待 actor 返回 `tx_id` 和 `result_shard`。
+- `SubmitTx` 返回点是 Sequencer 接受事务、分配 `tx_id` 并放入内部 batch；不等待 batch flush 或 shard 执行完成。
+- 接收 test driver 提交的内部 `FsOp` batch。
 - 校验 batch size 不超过配置上限，默认 `max_batch_size = 512`。
+- 通过 `batch_flush_interval` 关闭未满 batch，默认 1ms，可配置。
 - 分配递增 batch_id。
 - 分配递增 tx_id。
 - 计算 read/write set。
+- 计算 client-facing `result_shard`：write tx 取 active participants 中最小 shard id；read-only tx 取 `read_only_coordinator`。
 - 生成 `Batch { batch_id, txs }`，其中每个 tx 带有 batch_index。
 - 将同一个 `Batch` 发送给所有 shards。
 - 等待所有 shards 返回 `ExecuteBatchResponse`。
 - 保存 batch log 和 batch result，供 checker/debug 查询。
-- `SubmitBatch` 同步返回 batch result；第一版不提供额外 per-tx 查询 RPC。
+- `SubmitBatch` 同步返回 batch result，但只作为 internal/test API。
 
-第一阶段 assumptions：
+核心内部命令：
+
+```rust
+pub struct SubmitTxCommand {
+    pub op: FsOp,
+    pub reply: oneshot::Sender<Result<SubmitTxAck>>,
+}
+
+pub struct SubmitTxAck {
+    pub tx_id: TxId,
+    pub result_shard: ShardId,
+}
+```
+
+assumptions：
 
 - shard membership 在测试启动时明确。
 - `max_batch_size` 是 Sequencer 配置项，默认 512；超过上限的 `SubmitBatch` 返回 `InvalidArgument`，不生成 `Batch`。
+- `batch_flush_interval` 是 Sequencer 配置项，默认 1ms；open batch 只要非空，达到 size 或 timeout 任一条件都会 seal。
 - 每个 tx 的 participants 由 batch 内 read/write set 和 `ShardLayout` 确定，并在 batch 执行期间一直存活。
 - Sequencer 不处理 participant failure、retry、membership change。
 - Sequencer 的 batch log 只存在于 Sequencer/test driver，用于 checker 和 debug；shards 对它无感知。
-- 后续 milestone 再把 batch producer 扩展为持续接收在线请求的 append-only log producer。
 
 ### 3.8 `sim`
 
@@ -494,7 +530,8 @@ madsim 测试和模拟集群工具。
 - 启动 tonic Shard server。
 - 启动 tonic Sequencer server。
 - 创建 tonic clients。
-- 向 Sequencer 提交 FsOp batch，由 Sequencer 构造 batch 并发送给所有 shards。
+- 通过内部 `SubmitBatch` 运行大规模集成 workload。
+- 通过 client-facing `SubmitTx` + blocking `GetTxResult` 验证在线单事务 API。
 - 运行多节点功能测试；第一阶段不主动注入乱序、网络故障或 participant crash。
 - 调用 checker。
 
@@ -529,11 +566,13 @@ service Shard {
   rpc Ping(PingRequest) returns (PingResponse);
   rpc ExecuteBatch(ExecuteBatchRequest) returns (ExecuteBatchResponse);
   rpc LocalReadResult(LocalReadResultRequest) returns (LocalReadResultResponse);
+  rpc GetTxResult(GetTxResultRequest) returns (GetTxResultResponse);
   rpc DumpState(DumpStateRequest) returns (DumpStateResponse);
 }
 
 service Sequencer {
   rpc Ping(PingRequest) returns (PingResponse);
+  rpc SubmitTx(SubmitTxRequest) returns (SubmitTxResponse);
   rpc SubmitBatch(SubmitBatchRequest) returns (SubmitBatchResponse);
 }
 
@@ -562,6 +601,17 @@ message LocalReadResultRequest {
 }
 
 message LocalReadResultResponse {}
+
+message GetTxResultRequest {
+  uint64 tx_id = 1;
+}
+
+message GetTxResultResponse {
+  uint64 tx_id = 1;
+  uint64 shard_id = 2;
+  TxResultStatus status = 3;
+  TxResult result = 4;
+}
 
 message DumpStateRequest {}
 
@@ -654,10 +704,25 @@ enum TxResult {
   TX_RESULT_INVALID = 6;
 }
 
+enum TxResultStatus {
+  TX_RESULT_STATUS_UNSPECIFIED = 0;
+  TX_RESULT_STATUS_READY = 1;
+  TX_RESULT_STATUS_NOT_RESPONSIBLE = 2;
+}
+
 message TxResultRecord {
   uint64 tx_id = 1;
   uint64 shard_id = 2;
   TxResult result = 3;
+}
+
+message SubmitTxRequest {
+  FsOp op = 1;
+}
+
+message SubmitTxResponse {
+  uint64 tx_id = 1;
+  uint64 result_shard = 2;
 }
 
 message SubmitBatchRequest {
@@ -672,17 +737,22 @@ message SubmitBatchResponse {
 
 ```
 
-后续在线模式可扩展单事务接口：
-
-```proto
-rpc SubmitTx(SubmitTxRequest) returns (SubmitTxResponse);
-```
-
 ## 5. 事务执行流程
 
 ### 5.1 Sequencer 生成并发送 Batch
 
-第一阶段由 test driver 调用 Sequencer 的 `SubmitBatch`：
+client-facing 路径由 client 调用 Sequencer 的 `SubmitTx`：
+
+1. `SubmitTx` RPC handler 解析 `FsOp`。
+2. handler 创建 `oneshot` reply channel，并向 Sequencer actor 发送 `SubmitTxCommand`。
+3. actor 串行分配递增 `tx_id`，计算 read/write set 和 `result_shard`。
+4. actor 将 tx 放入当前 open batch，并通过 `oneshot` 返回 `SubmitTxAck { tx_id, result_shard }`。
+5. handler 立即向 client 返回 `SubmitTxResponse`，不等待 batch flush 或 shard 执行完成。
+6. open batch 在达到 `max_batch_size` 或 `batch_flush_interval` 后 seal。
+7. dispatcher 将 sealed batch 发送给所有 shards 的 `ExecuteBatch`。
+8. dispatcher 等待所有 shards 返回 `ExecuteBatchResponse` 后才发送下一个 batch。
+
+internal/test 路径由 test driver 调用 Sequencer 的 `SubmitBatch`：
 
 1. Sequencer 接收一批 `FsOp`。
 2. Sequencer 校验 batch size 不超过 `max_batch_size`。
@@ -693,7 +763,7 @@ rpc SubmitTx(SubmitTxRequest) returns (SubmitTxResponse);
 7. Sequencer 将同一个 `Batch` 发送给所有 shards 的 `ExecuteBatch`。
 8. Sequencer 等待所有 shards 返回 `ExecuteBatchResponse`。
 9. Sequencer 聚合 batch result，并向 caller 返回 `SubmitBatchResponse`。
-10. 只有当前 batch 完成后，Sequencer 才接受或发送下一个 batch。
+10. `SubmitBatch` 仅作为 internal/test API；client-facing API 不暴露 `batch_id`。
 
 Sequencer 内部可以保存 `Vec<Batch>` 作为测试和 debug 用的 batch log。这个 log 不下发、不安装到 shard，shard 对它无感知。
 
@@ -777,17 +847,28 @@ active worker 的执行顺序：
 9. 调用 `filter_local_writes` 计算本 shard 的 local writes。
 10. 校验 local writes 的 key 都属于本 shard，且都在本 tx 的 local write keys 内。
 11. 在一个 store write transaction 中应用 local writes。
-12. 写入完成后，将 tx result 返回给 executor。
-13. executor 记录 tx result。
-14. executor release lock queues，并通知每个被 release queue 的新队首。
+12. 若本 shard 是该 tx 的 `result_shard`，写入完成后更新 `TxResultRegistry` 为 `Ready(result)`。
+13. 将 tx result 返回给 executor。
+14. executor 记录 tx result。
+15. executor release lock queues，并通知每个被 release queue 的新队首。
 
-### 5.4 DumpState
+### 5.4 GetTxResult 和 DumpState
+
+`GetTxResult` 是 client-facing 查询接口，但语义是 blocking wait，不是 polling：
+
+- client 只能依赖 `SubmitTxResponse.result_shard` 查询事务结果。
+- `GetTxResult(tx_id)` 进入 shard 后，订阅或创建该 `tx_id` 的 `TxResultRegistry` entry。
+- 若状态已是 `Ready(result)`，立即返回 `TX_RESULT_STATUS_READY`。
+- 若状态是 `NotResponsible`，立即返回 `TX_RESULT_STATUS_NOT_RESPONSIBLE`。
+- 若状态是 `Pending`，RPC handler await `watch::Receiver::changed()`，直到状态进入终态。
+- response 不包含 `Pending`；未完成时 RPC 不返回。
+- 任意错误 shard 或无效 tx_id 查询不作为第一版用户语义保证；client 应设置 RPC deadline。
 
 `DumpState` 是测试/调试接口：
 
 - `DumpState` 用于 checker 拉取 shard local state。
 
-第一版不需要 shard 级 per-tx polling RPC。Sequencer 通过等待所有 shards 的 `ExecuteBatchResponse` 判断 batch 完成，并把聚合结果直接放入 `SubmitBatchResponse`。
+Sequencer 仍通过等待所有 shards 的 `ExecuteBatchResponse` 判断 batch barrier 完成；这和 client 通过 `GetTxResult` 获取单事务结果是两条不同路径。
 
 ### 5.5 Shard 内部 tokio 执行模型
 
@@ -802,6 +883,7 @@ pub struct ShardRuntime {
     peers: BTreeMap<ShardId, ShardClient>,
     batch_tx: mpsc::Sender<BatchJob>,
     read_result_mailboxes: Arc<Mutex<ReadResultMailboxRegistry>>,
+    client_results: TxResultRegistry,
 }
 
 pub struct BatchJob {
@@ -1120,14 +1202,24 @@ all_shards_dump -> sharded_final_state
 - final state 与 serial reference 对齐。
 - active participant tx results 一致。
 
-### Milestone 2：streaming online Sequencer
+### Milestone 2：online SubmitTx and blocking GetTxResult
 
 范围：
 
-- 在 Milestone 1 的 Sequencer 基础上支持持续接收单事务 `SubmitTx`。
-- 将 batch producer 扩展为在线 append-only batch log。
-- 支持客户端 result 查询和简单 backpressure。
+- 在 Milestone 1 的 Sequencer 基础上支持 client-facing 单事务 `SubmitTx`。
+- Sequencer 使用 actor + `oneshot` reply 管理 online submit、open batch、flush timer 和 dispatch queue。
+- open batch 使用 `max_batch_size = 512` 和可配置 `batch_flush_interval` 双条件 flush。
+- `SubmitTx` 返回 `tx_id` 和单个 `result_shard`，不暴露 `batch_id`。
+- Shard 提供 blocking `GetTxResult`，通过 awaitable `TxResultRegistry` 等待结果完成。
+- `SubmitBatch` 保留为 internal/test API。
 - 保持不处理 participant failure。
+
+完成标准：
+
+- client 只调用 `SubmitTx` 和 `GetTxResult` 即可完成基本元数据事务。
+- `GetTxResult` 未完成时在服务端 await，不需要 client polling。
+- read-only `Stat` 的 `result_shard` 等于 deterministic read-only coordinator。
+- madsim client API test 通过，并且 final state 与 serial reference execution 一致。
 
 ### Milestone 3：engine workload and validation
 
@@ -1141,7 +1233,7 @@ all_shards_dump -> sharded_final_state
 
 ## 10. 收敛状态
 
-当前 v1 设计选择已收敛，暂无阻塞 Milestone 1 实现的开放问题。后续讨论应以实现过程中暴露出的具体 bug、测试缺口或性能瓶颈为准。
+当前 v2 设计选择已收敛：client-facing API 固定为 `SubmitTx` + blocking `GetTxResult`，batch 仍是 Sequencer 和 shard 之间的内部执行单位。后续讨论应以实现过程中暴露出的具体 bug、测试缺口或性能瓶颈为准。
 
 ## 11. 术语
 
