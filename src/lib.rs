@@ -7,6 +7,7 @@ pub mod lock;
 pub mod model;
 pub mod proto;
 pub mod router;
+pub mod scc;
 pub mod service;
 pub mod storage;
 pub mod workload;

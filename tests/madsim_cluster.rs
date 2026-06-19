@@ -2,13 +2,16 @@
 
 use anyhow::{bail, Result};
 use calvinfs_demo::checker::{
-    assert_state_matches, assert_tx_results_consistent, merge_shard_states,
-    reference_execute_batches,
+    assert_scc_reorders_consistent, assert_state_matches, assert_tx_results_consistent,
+    merge_shard_states, reference_execute_batches, reference_execute_scc_reordered_batches,
 };
 use calvinfs_demo::convert::{
-    fs_op_to_proto, inode_entries_from_proto, tx_result_from_i32, tx_result_records_from_proto,
+    fs_op_to_proto, inode_entries_from_proto, scc_reorder_records_from_proto, tx_result_from_i32,
+    tx_result_records_from_proto,
 };
-use calvinfs_demo::engine::{SequencerConfig, SequencerRuntime, ShardConfig, ShardRuntime};
+use calvinfs_demo::engine::{
+    SchedulerKind, SequencerConfig, SequencerRuntime, ShardConfig, ShardRuntime,
+};
 use calvinfs_demo::executor::derive_read_write_set;
 use calvinfs_demo::model::{Batch, FsOp, Key, OrderedTx, ShardId, TxResult, TxResultRecord};
 use calvinfs_demo::proto::pb;
@@ -92,6 +95,117 @@ async fn submit_tx_get_result_client_api() -> Result<()> {
 }
 
 #[madsim::test]
+async fn scc_same_parent_create_batch() -> Result<()> {
+    let mut shard_endpoints = BTreeMap::new();
+    for shard_id in 0..SHARD_COUNT {
+        let ip = shard_ip(shard_id);
+        shard_endpoints.insert(shard_id, endpoint(ip, SHARD_PORT));
+    }
+    for shard_id in 0..SHARD_COUNT {
+        let ip = shard_ip(shard_id);
+        start_shard_node_with_scheduler(
+            shard_id,
+            ip,
+            shard_endpoints.clone(),
+            SchedulerKind::SccOnline,
+        );
+    }
+
+    let sequencer_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 100));
+    let sequencer_endpoint = endpoint(sequencer_ip, SEQUENCER_PORT);
+    start_sequencer_node(sequencer_ip, shard_endpoints.clone());
+
+    let driver = madsim::runtime::Handle::current()
+        .create_node()
+        .name("scc-driver")
+        .ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 202)))
+        .build();
+    driver
+        .spawn(run_scc_same_parent_create_driver(
+            sequencer_endpoint,
+            shard_endpoints,
+        ))
+        .await
+        .expect("scc driver task panicked")?;
+
+    Ok(())
+}
+
+#[madsim::test]
+async fn scc_prediction_failure_fallback() -> Result<()> {
+    let mut shard_endpoints = BTreeMap::new();
+    for shard_id in 0..SHARD_COUNT {
+        let ip = shard_ip(shard_id);
+        shard_endpoints.insert(shard_id, endpoint(ip, SHARD_PORT));
+    }
+    for shard_id in 0..SHARD_COUNT {
+        let ip = shard_ip(shard_id);
+        start_shard_node_with_scheduler(
+            shard_id,
+            ip,
+            shard_endpoints.clone(),
+            SchedulerKind::SccOnline,
+        );
+    }
+
+    let sequencer_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 100));
+    let sequencer_endpoint = endpoint(sequencer_ip, SEQUENCER_PORT);
+    start_sequencer_node(sequencer_ip, shard_endpoints.clone());
+
+    let driver = madsim::runtime::Handle::current()
+        .create_node()
+        .name("scc-fallback-driver")
+        .ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 203)))
+        .build();
+    driver
+        .spawn(run_scc_prediction_failure_driver(
+            sequencer_endpoint,
+            shard_endpoints,
+        ))
+        .await
+        .expect("scc fallback driver task panicked")?;
+
+    Ok(())
+}
+
+#[madsim::test]
+async fn scc_mixed_metadata_success_batch() -> Result<()> {
+    let mut shard_endpoints = BTreeMap::new();
+    for shard_id in 0..SHARD_COUNT {
+        let ip = shard_ip(shard_id);
+        shard_endpoints.insert(shard_id, endpoint(ip, SHARD_PORT));
+    }
+    for shard_id in 0..SHARD_COUNT {
+        let ip = shard_ip(shard_id);
+        start_shard_node_with_scheduler(
+            shard_id,
+            ip,
+            shard_endpoints.clone(),
+            SchedulerKind::SccOnline,
+        );
+    }
+
+    let sequencer_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 100));
+    let sequencer_endpoint = endpoint(sequencer_ip, SEQUENCER_PORT);
+    start_sequencer_node(sequencer_ip, shard_endpoints.clone());
+
+    let driver = madsim::runtime::Handle::current()
+        .create_node()
+        .name("scc-mixed-driver")
+        .ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 204)))
+        .build();
+    driver
+        .spawn(run_scc_mixed_metadata_driver(
+            sequencer_endpoint,
+            shard_endpoints,
+        ))
+        .await
+        .expect("scc mixed driver task panicked")?;
+
+    Ok(())
+}
+
+#[madsim::test]
 async fn mdtest_like_client_workload() -> Result<()> {
     let config = MdtestConfig::from_env()?;
     println!(
@@ -99,12 +213,354 @@ async fn mdtest_like_client_workload() -> Result<()> {
         config.client_count, config.dirs_per_client, config.files_per_client, config.batch_size
     );
 
-    let private_summary = run_mdtest_like_cluster(MdtestMode::Private, config, 20).await?;
-    let public_summary = run_mdtest_like_cluster(MdtestMode::Public, config, 30).await?;
+    let calvin_private_summary =
+        run_mdtest_like_cluster(BenchmarkScheduler::Calvin, MdtestMode::Private, config, 20)
+            .await?;
+    let calvin_public_summary =
+        run_mdtest_like_cluster(BenchmarkScheduler::Calvin, MdtestMode::Public, config, 30).await?;
+    let scc_private_summary =
+        run_mdtest_like_cluster(BenchmarkScheduler::Scc, MdtestMode::Private, config, 40).await?;
+    let scc_public_summary =
+        run_mdtest_like_cluster(BenchmarkScheduler::Scc, MdtestMode::Public, config, 50).await?;
 
-    print_mode_summary(&private_summary, config.show_ranks);
-    print_mode_summary(&public_summary, config.show_ranks);
-    print_comparison_summary(&private_summary, &public_summary);
+    print_mode_summary(&calvin_private_summary, config.show_ranks);
+    print_mode_summary(&calvin_public_summary, config.show_ranks);
+    print_mode_summary(&scc_private_summary, config.show_ranks);
+    print_mode_summary(&scc_public_summary, config.show_ranks);
+    print_private_public_comparison(
+        BenchmarkScheduler::Calvin,
+        &calvin_private_summary,
+        &calvin_public_summary,
+    );
+    print_private_public_comparison(
+        BenchmarkScheduler::Scc,
+        &scc_private_summary,
+        &scc_public_summary,
+    );
+    print_scheduler_comparison(
+        MdtestMode::Private,
+        &calvin_private_summary,
+        &scc_private_summary,
+    );
+    print_scheduler_comparison(
+        MdtestMode::Public,
+        &calvin_public_summary,
+        &scc_public_summary,
+    );
+
+    Ok(())
+}
+
+async fn run_scc_prediction_failure_driver(
+    sequencer_endpoint: String,
+    shard_endpoints: BTreeMap<ShardId, String>,
+) -> Result<()> {
+    wait_for_shards(&shard_endpoints).await?;
+    wait_for_sequencer(&sequencer_endpoint).await?;
+
+    let mut sequencer = pb::sequencer_client::SequencerClient::connect(sequencer_endpoint).await?;
+    let mut reference_batches = Vec::new();
+    let mut all_records = Vec::new();
+
+    submit_expected_batch(
+        &mut sequencer,
+        vec![expect("scc_fallback:mkdir_root", mkdir("/")?, TxResult::Ok)],
+        &mut reference_batches,
+        &mut all_records,
+    )
+    .await?;
+    submit_expected_batch(
+        &mut sequencer,
+        vec![expect(
+            "scc_fallback:mkdir_d",
+            mkdir("/scc_fb")?,
+            TxResult::Ok,
+        )],
+        &mut reference_batches,
+        &mut all_records,
+    )
+    .await?;
+    submit_expected_batch(
+        &mut sequencer,
+        vec![
+            expect(
+                "scc_fallback:create_first",
+                create("/scc_fb/x")?,
+                TxResult::Ok,
+            ),
+            expect(
+                "scc_fallback:create_duplicate",
+                create("/scc_fb/x")?,
+                TxResult::AlreadyExists,
+            ),
+        ],
+        &mut reference_batches,
+        &mut all_records,
+    )
+    .await?;
+    let fallback_batch_id = reference_batches
+        .last()
+        .expect("fallback batch was just submitted")
+        .batch_id;
+
+    let mut shard_states = Vec::new();
+    let mut shard_reorders = Vec::new();
+    for (shard_id, endpoint) in &shard_endpoints {
+        let mut client = pb::shard_client::ShardClient::connect(endpoint.clone()).await?;
+        let response = client
+            .dump_state(pb::DumpStateRequest {})
+            .await?
+            .into_inner();
+        shard_states.push((*shard_id, inode_entries_from_proto(response.entries)?));
+        shard_reorders.push((
+            *shard_id,
+            scc_reorder_records_from_proto(response.scc_reorders),
+        ));
+    }
+
+    let layout = ShardLayout::new(SHARD_COUNT);
+    let scc_reorders = assert_scc_reorders_consistent(shard_reorders)?;
+    let fallback_reorder = scc_reorders
+        .get(&fallback_batch_id)
+        .ok_or_else(|| anyhow::anyhow!("missing SCC fallback reorder record"))?;
+    if fallback_reorder.speculative_success_indices != vec![0]
+        || fallback_reorder.fallback_indices != vec![1]
+    {
+        bail!(
+            "expected duplicate-create batch reorder success=[0] fallback=[1], got {:?}",
+            fallback_reorder
+        );
+    }
+    let expected = reference_execute_scc_reordered_batches(&reference_batches, &scc_reorders)?;
+    let actual = merge_shard_states(&layout, shard_states)?;
+    assert_state_matches(&expected, &actual)?;
+    assert_tx_results_consistent(&layout, &reference_batches, &all_records)?;
+
+    Ok(())
+}
+
+async fn run_scc_same_parent_create_driver(
+    sequencer_endpoint: String,
+    shard_endpoints: BTreeMap<ShardId, String>,
+) -> Result<()> {
+    wait_for_shards(&shard_endpoints).await?;
+    wait_for_sequencer(&sequencer_endpoint).await?;
+
+    let mut sequencer = pb::sequencer_client::SequencerClient::connect(sequencer_endpoint).await?;
+    let mut reference_batches = Vec::new();
+    let mut all_records = Vec::new();
+
+    submit_expected_batch(
+        &mut sequencer,
+        vec![expect("scc_setup:mkdir_root", mkdir("/")?, TxResult::Ok)],
+        &mut reference_batches,
+        &mut all_records,
+    )
+    .await?;
+    submit_expected_batch(
+        &mut sequencer,
+        vec![expect(
+            "scc_setup:mkdir_public",
+            mkdir("/scc_public")?,
+            TxResult::Ok,
+        )],
+        &mut reference_batches,
+        &mut all_records,
+    )
+    .await?;
+
+    let create_ops = (0..64)
+        .map(|index| {
+            Ok(expect(
+                format!("scc_create:file_{index}"),
+                create(&format!("/scc_public/file_{index}"))?,
+                TxResult::Ok,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    submit_expected_batch(
+        &mut sequencer,
+        create_ops,
+        &mut reference_batches,
+        &mut all_records,
+    )
+    .await?;
+
+    let mut shard_states = Vec::new();
+    let mut shard_reorders = Vec::new();
+    for (shard_id, endpoint) in &shard_endpoints {
+        let mut client = pb::shard_client::ShardClient::connect(endpoint.clone()).await?;
+        let response = client
+            .dump_state(pb::DumpStateRequest {})
+            .await?
+            .into_inner();
+        shard_states.push((*shard_id, inode_entries_from_proto(response.entries)?));
+        shard_reorders.push((
+            *shard_id,
+            scc_reorder_records_from_proto(response.scc_reorders),
+        ));
+    }
+
+    let layout = ShardLayout::new(SHARD_COUNT);
+    let scc_reorders = assert_scc_reorders_consistent(shard_reorders)?;
+    if scc_reorders
+        .values()
+        .any(|record| !record.fallback_indices.is_empty())
+    {
+        bail!(
+            "same-parent create SCC test should not use fallback, got {:?}",
+            scc_reorders
+        );
+    }
+    let expected = reference_execute_scc_reordered_batches(&reference_batches, &scc_reorders)?;
+    let actual = merge_shard_states(&layout, shard_states)?;
+    assert_state_matches(&expected, &actual)?;
+    assert_tx_results_consistent(&layout, &reference_batches, &all_records)?;
+    let public = actual
+        .get(&Key::new("/scc_public")?)
+        .ok_or_else(|| anyhow::anyhow!("missing /scc_public"))?;
+    assert_eq!(public.child_count, 64);
+
+    Ok(())
+}
+
+async fn run_scc_mixed_metadata_driver(
+    sequencer_endpoint: String,
+    shard_endpoints: BTreeMap<ShardId, String>,
+) -> Result<()> {
+    wait_for_shards(&shard_endpoints).await?;
+    wait_for_sequencer(&sequencer_endpoint).await?;
+
+    let mut sequencer = pb::sequencer_client::SequencerClient::connect(sequencer_endpoint).await?;
+    let mut reference_batches = Vec::new();
+    let mut all_records = Vec::new();
+
+    submit_expected_batch(
+        &mut sequencer,
+        vec![
+            expect("scc_mixed:mkdir_root", mkdir("/")?, TxResult::Ok),
+            expect("scc_mixed:mkdir_root_dir", mkdir("/scc_mix")?, TxResult::Ok),
+            expect("scc_mixed:mkdir_src", mkdir("/scc_mix/src")?, TxResult::Ok),
+            expect("scc_mixed:mkdir_dst", mkdir("/scc_mix/dst")?, TxResult::Ok),
+        ],
+        &mut reference_batches,
+        &mut all_records,
+    )
+    .await?;
+    submit_expected_batch(
+        &mut sequencer,
+        vec![
+            expect(
+                "scc_mixed:create_file_old",
+                create("/scc_mix/src/file_old")?,
+                TxResult::Ok,
+            ),
+            expect(
+                "scc_mixed:mkdir_empty_dir",
+                mkdir("/scc_mix/src/empty_dir")?,
+                TxResult::Ok,
+            ),
+            expect(
+                "scc_mixed:create_delete_file",
+                create("/scc_mix/src/delete_file")?,
+                TxResult::Ok,
+            ),
+            expect(
+                "scc_mixed:mkdir_delete_dir",
+                mkdir("/scc_mix/src/delete_dir")?,
+                TxResult::Ok,
+            ),
+        ],
+        &mut reference_batches,
+        &mut all_records,
+    )
+    .await?;
+    submit_expected_batch(
+        &mut sequencer,
+        vec![
+            expect(
+                "scc_mixed:create_new_file",
+                create("/scc_mix/src/new_file")?,
+                TxResult::Ok,
+            ),
+            expect(
+                "scc_mixed:unlink_delete_file",
+                unlink("/scc_mix/src/delete_file")?,
+                TxResult::Ok,
+            ),
+            expect(
+                "scc_mixed:rmdir_delete_dir",
+                rmdir("/scc_mix/src/delete_dir")?,
+                TxResult::Ok,
+            ),
+            expect(
+                "scc_mixed:rename_file",
+                rename("/scc_mix/src/file_old", "/scc_mix/dst/file_new")?,
+                TxResult::Ok,
+            ),
+            expect(
+                "scc_mixed:rename_empty_dir",
+                rename("/scc_mix/src/empty_dir", "/scc_mix/dst/empty_dir_new")?,
+                TxResult::Ok,
+            ),
+            expect(
+                "scc_mixed:stat_renamed_file",
+                stat("/scc_mix/dst/file_new")?,
+                TxResult::Ok,
+            ),
+            expect(
+                "scc_mixed:stat_new_file",
+                stat("/scc_mix/src/new_file")?,
+                TxResult::Ok,
+            ),
+        ],
+        &mut reference_batches,
+        &mut all_records,
+    )
+    .await?;
+
+    let mut shard_states = Vec::new();
+    let mut shard_reorders = Vec::new();
+    for (shard_id, endpoint) in &shard_endpoints {
+        let mut client = pb::shard_client::ShardClient::connect(endpoint.clone()).await?;
+        let response = client
+            .dump_state(pb::DumpStateRequest {})
+            .await?
+            .into_inner();
+        shard_states.push((*shard_id, inode_entries_from_proto(response.entries)?));
+        shard_reorders.push((
+            *shard_id,
+            scc_reorder_records_from_proto(response.scc_reorders),
+        ));
+    }
+
+    let layout = ShardLayout::new(SHARD_COUNT);
+    let scc_reorders = assert_scc_reorders_consistent(shard_reorders)?;
+    if scc_reorders
+        .values()
+        .any(|record| !record.fallback_indices.is_empty())
+    {
+        bail!(
+            "mixed SCC success test should not use fallback, got {:?}",
+            scc_reorders
+        );
+    }
+    let expected = reference_execute_scc_reordered_batches(&reference_batches, &scc_reorders)?;
+    let actual = merge_shard_states(&layout, shard_states)?;
+    assert_state_matches(&expected, &actual)?;
+    assert_tx_results_consistent(&layout, &reference_batches, &all_records)?;
+    if actual.contains_key(&Key::new("/scc_mix/src/file_old")?) {
+        bail!("renamed source file still exists");
+    }
+    if !actual.contains_key(&Key::new("/scc_mix/dst/file_new")?) {
+        bail!("renamed destination file missing");
+    }
+    if actual.contains_key(&Key::new("/scc_mix/src/delete_file")?) {
+        bail!("unlinked file still exists");
+    }
+    if actual.contains_key(&Key::new("/scc_mix/src/delete_dir")?) {
+        bail!("removed directory still exists");
+    }
 
     Ok(())
 }
@@ -308,6 +764,7 @@ async fn run_submit_tx_driver(
 }
 
 async fn run_mdtest_like_cluster(
+    scheduler: BenchmarkScheduler,
     mode: MdtestMode,
     config: MdtestConfig,
     network: u8,
@@ -320,17 +777,22 @@ async fn run_mdtest_like_cluster(
     for shard_id in 0..SHARD_COUNT {
         let ip = mdtest_shard_ip(network, shard_id);
         start_shard_node_with_name(
-            format!("mdtest-{}-shard-{shard_id}", mode.name()),
+            format!(
+                "mdtest-{}-{}-shard-{shard_id}",
+                scheduler.name(),
+                mode.name()
+            ),
             shard_id,
             ip,
             shard_endpoints.clone(),
+            scheduler.scheduler_kind(),
         );
     }
 
     let sequencer_ip = mdtest_node_ip(network, 100);
     let sequencer_endpoint = endpoint(sequencer_ip, SEQUENCER_PORT);
     start_sequencer_node_with_config_and_name(
-        format!("mdtest-{}-sequencer", mode.name()),
+        format!("mdtest-{}-{}-sequencer", scheduler.name(), mode.name()),
         sequencer_ip,
         shard_endpoints.clone(),
         config.batch_size,
@@ -339,11 +801,16 @@ async fn run_mdtest_like_cluster(
 
     let driver = madsim::runtime::Handle::current()
         .create_node()
-        .name(format!("mdtest-{}-driver", mode.name()))
+        .name(format!(
+            "mdtest-{}-{}-driver",
+            scheduler.name(),
+            mode.name()
+        ))
         .ip(mdtest_node_ip(network, 200))
         .build();
     driver
         .spawn(run_mdtest_like_client_driver(
+            scheduler,
             mode,
             sequencer_endpoint,
             shard_endpoints,
@@ -354,6 +821,7 @@ async fn run_mdtest_like_cluster(
 }
 
 async fn run_mdtest_like_client_driver(
+    scheduler: BenchmarkScheduler,
     mode: MdtestMode,
     sequencer_endpoint: String,
     shard_endpoints: BTreeMap<ShardId, String>,
@@ -373,7 +841,14 @@ async fn run_mdtest_like_client_driver(
     )
     .await?;
 
-    let summary = run_mdtest_mode(mode, &config, &sequencer_endpoint, &shard_endpoints).await?;
+    let summary = run_mdtest_mode(
+        scheduler,
+        mode,
+        &config,
+        &sequencer_endpoint,
+        &shard_endpoints,
+    )
+    .await?;
 
     submit_client_tx(
         &mut sequencer,
@@ -393,6 +868,35 @@ async fn run_mdtest_like_client_driver(
     .await?;
 
     Ok(summary)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BenchmarkScheduler {
+    Calvin,
+    Scc,
+}
+
+impl BenchmarkScheduler {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Calvin => "calvin",
+            Self::Scc => "scc",
+        }
+    }
+
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::Calvin => "Calvin",
+            Self::Scc => "SCC",
+        }
+    }
+
+    fn scheduler_kind(self) -> SchedulerKind {
+        match self {
+            Self::Calvin => SchedulerKind::CalvinLocking,
+            Self::Scc => SchedulerKind::SccOnline,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -555,6 +1059,7 @@ struct PhaseSummary {
 
 #[derive(Clone, Debug)]
 struct ModeSummary {
+    scheduler: BenchmarkScheduler,
     mode: MdtestMode,
     phases: Vec<PhaseSummary>,
 }
@@ -567,6 +1072,7 @@ struct FloatStats {
 }
 
 async fn run_mdtest_mode(
+    scheduler: BenchmarkScheduler,
     mode: MdtestMode,
     config: &MdtestConfig,
     sequencer_endpoint: &str,
@@ -584,7 +1090,11 @@ async fn run_mdtest_mode(
     }
 
     cleanup_mdtest_mode(&mut sequencer, shard_endpoints, mode, config).await?;
-    Ok(ModeSummary { mode, phases })
+    Ok(ModeSummary {
+        scheduler,
+        mode,
+        phases,
+    })
 }
 
 async fn run_mdtest_phase(
@@ -909,7 +1419,8 @@ impl PhaseSummary {
 
 fn print_mode_summary(summary: &ModeSummary, show_ranks: bool) {
     println!(
-        "\n{} mode SUMMARY rate (in ops/sec):",
+        "\n{} {} mode SUMMARY rate (in ops/sec):",
+        summary.scheduler.display_name(),
         summary.mode.name().to_uppercase()
     );
     println!(
@@ -936,7 +1447,8 @@ fn print_mode_summary(summary: &ModeSummary, show_ranks: bool) {
     }
 
     println!(
-        "\n{} mode SUMMARY time (in ms/op):",
+        "\n{} {} mode SUMMARY time (in ms/op):",
+        summary.scheduler.display_name(),
         summary.mode.name().to_uppercase()
     );
     println!(
@@ -964,7 +1476,8 @@ fn print_mode_summary(summary: &ModeSummary, show_ranks: bool) {
 
     if show_ranks {
         println!(
-            "\n{} mode per-rank details:",
+            "\n{} {} mode per-rank details:",
+            summary.scheduler.display_name(),
             summary.mode.name().to_uppercase()
         );
         println!(
@@ -1008,8 +1521,12 @@ fn print_summary_row(
     );
 }
 
-fn print_comparison_summary(private_summary: &ModeSummary, public_summary: &ModeSummary) {
-    println!("\nPrivate/Public comparison:");
+fn print_private_public_comparison(
+    scheduler: BenchmarkScheduler,
+    private_summary: &ModeSummary,
+    public_summary: &ModeSummary,
+) {
+    println!("\n{} Private/Public comparison:", scheduler.display_name());
     println!(
         "{:<22} {:>16} {:>16} {:>16}",
         "Operation", "Private ops/s", "Public ops/s", "Public/Private"
@@ -1030,6 +1547,40 @@ fn print_comparison_summary(private_summary: &ModeSummary, public_summary: &Mode
             private_phase.phase.name(),
             private_phase.aggregate_ops_per_sec,
             public_phase.aggregate_ops_per_sec,
+            ratio
+        );
+    }
+}
+
+fn print_scheduler_comparison(
+    mode: MdtestMode,
+    calvin_summary: &ModeSummary,
+    scc_summary: &ModeSummary,
+) {
+    println!(
+        "\n{} SCC/Calvin comparison:",
+        mode.name().to_ascii_uppercase()
+    );
+    println!(
+        "{:<22} {:>16} {:>16} {:>16}",
+        "Operation", "Calvin ops/s", "SCC ops/s", "SCC/Calvin"
+    );
+    for calvin_phase in &calvin_summary.phases {
+        let scc_phase = scc_summary
+            .phases
+            .iter()
+            .find(|phase| phase.phase == calvin_phase.phase)
+            .expect("SCC summary should contain same phase");
+        let ratio = if calvin_phase.aggregate_ops_per_sec == 0.0 {
+            0.0
+        } else {
+            scc_phase.aggregate_ops_per_sec / calvin_phase.aggregate_ops_per_sec
+        };
+        println!(
+            "{:<22} {:>16.3} {:>16.3} {:>16.3}",
+            calvin_phase.phase.name(),
+            calvin_phase.aggregate_ops_per_sec,
+            scc_phase.aggregate_ops_per_sec,
             ratio
         );
     }
@@ -1576,7 +2127,22 @@ fn stat(path: &str) -> Result<FsOp> {
 }
 
 fn start_shard_node(shard_id: ShardId, ip: IpAddr, peer_endpoints: BTreeMap<ShardId, String>) {
-    start_shard_node_with_name(format!("shard-{shard_id}"), shard_id, ip, peer_endpoints);
+    start_shard_node_with_scheduler(shard_id, ip, peer_endpoints, SchedulerKind::CalvinLocking);
+}
+
+fn start_shard_node_with_scheduler(
+    shard_id: ShardId,
+    ip: IpAddr,
+    peer_endpoints: BTreeMap<ShardId, String>,
+    scheduler: SchedulerKind,
+) {
+    start_shard_node_with_name(
+        format!("shard-{shard_id}"),
+        shard_id,
+        ip,
+        peer_endpoints,
+        scheduler,
+    );
 }
 
 fn start_shard_node_with_name(
@@ -1584,6 +2150,7 @@ fn start_shard_node_with_name(
     shard_id: ShardId,
     ip: IpAddr,
     peer_endpoints: BTreeMap<ShardId, String>,
+    scheduler: SchedulerKind,
 ) {
     let node = madsim::runtime::Handle::current()
         .create_node()
@@ -1597,6 +2164,7 @@ fn start_shard_node_with_name(
                 shard_id,
                 shard_count: SHARD_COUNT,
                 peer_endpoints,
+                scheduler,
             })
             .expect("create shard runtime"),
         );

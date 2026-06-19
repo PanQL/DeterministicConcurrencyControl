@@ -6,6 +6,7 @@ service Shard {
   rpc Ping(PingRequest) returns (PingResponse);
   rpc ExecuteBatch(ExecuteBatchRequest) returns (ExecuteBatchResponse);
   rpc LocalReadResult(LocalReadResultRequest) returns (LocalReadResultResponse);
+  rpc ReportSccCompletion(SccCompletionReportRequest) returns (SccCompletionReportResponse);
   rpc GetTxResult(GetTxResultRequest) returns (GetTxResultResponse);
   rpc DumpState(DumpStateRequest) returns (DumpStateResponse);
 }
@@ -38,9 +39,19 @@ message LocalReadResultRequest {
   uint64 tx_id = 2;
   uint64 from_shard = 3;
   repeated ReadEntry reads = 4;
+  ReadPhase phase = 5;
+  LocalReadStatus status = 6;
 }
 
 message LocalReadResultResponse {}
+
+message SccCompletionReportRequest {
+  uint64 batch_id = 1;
+  uint64 from_shard = 2;
+  repeated uint32 failed_tx_indices = 3;
+}
+
+message SccCompletionReportResponse {}
 
 message GetTxResultRequest {
   uint64 tx_id = 1;
@@ -57,6 +68,7 @@ message DumpStateRequest {}
 
 message DumpStateResponse {
   repeated InodeEntry entries = 1;
+  repeated SccReorderRecord scc_reorders = 2;
 }
 
 message Batch {
@@ -150,10 +162,29 @@ enum TxResultStatus {
   TX_RESULT_STATUS_NOT_RESPONSIBLE = 2;
 }
 
+enum ReadPhase {
+  READ_PHASE_UNSPECIFIED = 0;
+  READ_PHASE_CALVIN = 1;
+  READ_PHASE_SCC_EFFECT = 2;
+  READ_PHASE_SCC_CONDITION = 3;
+}
+
+enum LocalReadStatus {
+  LOCAL_READ_STATUS_UNSPECIFIED = 0;
+  LOCAL_READ_STATUS_OK = 1;
+  LOCAL_READ_STATUS_SPECULATION_FAILED = 2;
+}
+
 message TxResultRecord {
   uint64 tx_id = 1;
   uint64 shard_id = 2;
   TxResult result = 3;
+}
+
+message SccReorderRecord {
+  uint64 batch_id = 1;
+  repeated uint32 speculative_success_indices = 2;
+  repeated uint32 fallback_indices = 3;
 }
 
 message SubmitTxRequest {

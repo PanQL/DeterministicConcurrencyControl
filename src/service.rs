@@ -1,8 +1,11 @@
 use crate::convert::{
-    batch_from_proto, fs_op_from_proto, inode_entries_to_proto, read_entries_from_proto,
+    batch_from_proto, fs_op_from_proto, inode_entries_to_proto, local_read_status_from_i32,
+    read_entries_from_proto, read_phase_from_i32, scc_reorder_records_to_proto,
     tx_result_records_to_proto, tx_result_to_i32,
 };
-use crate::engine::{ClientTxResult, LocalReadResult, SequencerRuntime, ShardRuntime};
+use crate::engine::{
+    ClientTxResult, LocalReadResult, SccCompletionReport, SequencerRuntime, ShardRuntime,
+};
 use crate::proto::pb;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
@@ -60,12 +63,34 @@ impl pb::shard_server::Shard for ShardService {
             .route_local_read_result(LocalReadResult {
                 batch_id: request.batch_id,
                 tx_id: request.tx_id,
+                phase: read_phase_from_i32(request.phase).map_err(Status::from)?,
                 from_shard: request.from_shard,
+                status: local_read_status_from_i32(request.status).map_err(Status::from)?,
                 reads,
             })
             .await
             .map_err(Status::from)?;
         Ok(Response::new(pb::LocalReadResultResponse {}))
+    }
+
+    async fn report_scc_completion(
+        &self,
+        request: Request<pb::SccCompletionReportRequest>,
+    ) -> std::result::Result<Response<pb::SccCompletionReportResponse>, Status> {
+        let request = request.into_inner();
+        self.runtime
+            .route_scc_completion_report(SccCompletionReport {
+                batch_id: request.batch_id,
+                from_shard: request.from_shard,
+                failed_tx_indices: request
+                    .failed_tx_indices
+                    .into_iter()
+                    .map(|index| index as usize)
+                    .collect(),
+            })
+            .await
+            .map_err(Status::from)?;
+        Ok(Response::new(pb::SccCompletionReportResponse {}))
     }
 
     async fn get_tx_result(
@@ -100,8 +125,10 @@ impl pb::shard_server::Shard for ShardService {
         _request: Request<pb::DumpStateRequest>,
     ) -> std::result::Result<Response<pb::DumpStateResponse>, Status> {
         let state = self.runtime.dump_state().map_err(Status::from)?;
+        let scc_reorders = self.runtime.dump_scc_reorders().await;
         Ok(Response::new(pb::DumpStateResponse {
             entries: inode_entries_to_proto(&state),
+            scc_reorders: scc_reorder_records_to_proto(&scc_reorders),
         }))
     }
 }

@@ -1,6 +1,7 @@
 use crate::error::{Error, Result};
 use crate::model::{
-    Batch, FsOp, Inode, Key, NodeKind, OrderedTx, ReadValue, TxResult, TxResultRecord,
+    Batch, FsOp, Inode, Key, LocalReadStatus, NodeKind, OrderedTx, ReadPhase, ReadValue,
+    SccReorderRecord, TxResult, TxResultRecord,
 };
 use crate::proto::pb;
 use std::collections::{BTreeMap, BTreeSet};
@@ -200,6 +201,49 @@ pub fn tx_result_records_from_proto(
         .collect()
 }
 
+pub fn scc_reorder_record_to_proto(value: &SccReorderRecord) -> pb::SccReorderRecord {
+    pb::SccReorderRecord {
+        batch_id: value.batch_id,
+        speculative_success_indices: value
+            .speculative_success_indices
+            .iter()
+            .map(|index| *index as u32)
+            .collect(),
+        fallback_indices: value
+            .fallback_indices
+            .iter()
+            .map(|index| *index as u32)
+            .collect(),
+    }
+}
+
+pub fn scc_reorder_record_from_proto(value: pb::SccReorderRecord) -> SccReorderRecord {
+    SccReorderRecord {
+        batch_id: value.batch_id,
+        speculative_success_indices: value
+            .speculative_success_indices
+            .into_iter()
+            .map(|index| index as usize)
+            .collect(),
+        fallback_indices: value
+            .fallback_indices
+            .into_iter()
+            .map(|index| index as usize)
+            .collect(),
+    }
+}
+
+pub fn scc_reorder_records_to_proto(values: &[SccReorderRecord]) -> Vec<pb::SccReorderRecord> {
+    values.iter().map(scc_reorder_record_to_proto).collect()
+}
+
+pub fn scc_reorder_records_from_proto(values: Vec<pb::SccReorderRecord>) -> Vec<SccReorderRecord> {
+    values
+        .into_iter()
+        .map(scc_reorder_record_from_proto)
+        .collect()
+}
+
 pub fn tx_result_to_i32(value: TxResult) -> i32 {
     match value {
         TxResult::Ok => 1,
@@ -220,6 +264,43 @@ pub fn tx_result_from_i32(value: i32) -> Result<TxResult> {
         5 => TxResult::DirectoryNotEmpty,
         6 => TxResult::Invalid,
         _ => return Err(Error::InvalidProto(format!("invalid TxResult {}", value))),
+    })
+}
+
+pub fn read_phase_to_i32(value: ReadPhase) -> i32 {
+    match value {
+        ReadPhase::Calvin => 1,
+        ReadPhase::SccEffect => 2,
+        ReadPhase::SccCondition => 3,
+    }
+}
+
+pub fn read_phase_from_i32(value: i32) -> Result<ReadPhase> {
+    Ok(match value {
+        1 => ReadPhase::Calvin,
+        2 => ReadPhase::SccEffect,
+        3 => ReadPhase::SccCondition,
+        _ => return Err(Error::InvalidProto(format!("invalid ReadPhase {}", value))),
+    })
+}
+
+pub fn local_read_status_to_i32(value: LocalReadStatus) -> i32 {
+    match value {
+        LocalReadStatus::Ok => 1,
+        LocalReadStatus::SpeculationFailed => 2,
+    }
+}
+
+pub fn local_read_status_from_i32(value: i32) -> Result<LocalReadStatus> {
+    Ok(match value {
+        1 => LocalReadStatus::Ok,
+        2 => LocalReadStatus::SpeculationFailed,
+        _ => {
+            return Err(Error::InvalidProto(format!(
+                "invalid LocalReadStatus {}",
+                value
+            )))
+        }
     })
 }
 

@@ -1,14 +1,22 @@
-use crate::convert::{batch_to_proto, read_entries_to_proto};
+use crate::convert::{
+    batch_to_proto, local_read_status_to_i32, read_entries_to_proto, read_phase_to_i32,
+};
 use crate::error::{Error, Result};
 use crate::executor::{
     derive_read_write_set, execute_deterministic, filter_local_writes, validate_sets,
 };
 use crate::lock::{LockGrant, LockTable};
 use crate::model::{
-    Batch, BatchId, FsOp, Inode, Key, OrderedTx, ReadValue, ShardId, TxId, TxResult, TxResultRecord,
+    Batch, BatchId, FsOp, Inode, Key, LocalReadStatus, OrderedTx, ReadPhase, ReadValue,
+    SccReorderRecord, ShardId, TxId, TxResult, TxResultRecord,
 };
 use crate::proto::pb;
 use crate::router::{Participants, ShardLayout};
+use crate::scc::{
+    build_scc_batch_plan, check_success_path_condition, classify_actual_path, filter_delta_to_keys,
+    materialized_local_read, output_to_delta, CommitSequence, CommitSlotState, SccDagRuntime,
+    SccPhase, SccTxPlan, TxDagWaiters, TxDelta,
+};
 use crate::storage::RedbInMemoryInodeStore;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -20,12 +28,25 @@ const DEFAULT_MAILBOX_CAPACITY: usize = 1024;
 const SEQUENCER_COMMAND_CAPACITY: usize = 1024;
 const DEFAULT_BATCH_FLUSH_INTERVAL: Duration = Duration::from_millis(1);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SchedulerKind {
+    CalvinLocking,
+    SccOnline,
+}
+
+impl Default for SchedulerKind {
+    fn default() -> Self {
+        Self::CalvinLocking
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ShardConfig {
     pub node_id: String,
     pub shard_id: ShardId,
     pub shard_count: u64,
     pub peer_endpoints: BTreeMap<ShardId, String>,
+    pub scheduler: SchedulerKind,
 }
 
 #[derive(Clone)]
@@ -42,6 +63,9 @@ struct ShardCore {
     peer_endpoints: Arc<BTreeMap<ShardId, String>>,
     mailboxes: ReadResultMailboxRegistry,
     client_results: TxResultRegistry,
+    scc_completion_reports: SccCompletionReportRegistry,
+    scc_reorders: Arc<Mutex<BTreeMap<BatchId, SccReorderRecord>>>,
+    scheduler: SchedulerKind,
 }
 
 pub struct BatchExecutionSummary {
@@ -66,6 +90,9 @@ impl ShardRuntime {
             peer_endpoints: Arc::new(config.peer_endpoints),
             mailboxes: ReadResultMailboxRegistry::new(),
             client_results: TxResultRegistry::new(),
+            scc_completion_reports: SccCompletionReportRegistry::new(),
+            scc_reorders: Arc::new(Mutex::new(BTreeMap::new())),
+            scheduler: config.scheduler,
         });
         tokio::spawn(run_batch_executor(core.clone(), batch_rx));
         Ok(Self { core, batch_tx })
@@ -101,6 +128,20 @@ impl ShardRuntime {
     pub fn dump_state(&self) -> Result<BTreeMap<Key, Inode>> {
         self.core.store.dump()
     }
+
+    pub async fn dump_scc_reorders(&self) -> Vec<SccReorderRecord> {
+        self.core
+            .scc_reorders
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    pub async fn route_scc_completion_report(&self, report: SccCompletionReport) -> Result<()> {
+        self.core.scc_completion_reports.route(report).await
+    }
 }
 
 async fn run_batch_executor(core: Arc<ShardCore>, mut batch_rx: mpsc::Receiver<BatchJob>) {
@@ -114,15 +155,18 @@ async fn execute_batch_on_shard(
     core: Arc<ShardCore>,
     batch: Batch,
 ) -> Result<BatchExecutionSummary> {
-    let result = execute_batch_on_shard_inner(core.clone(), batch.clone()).await;
+    let result = match core.scheduler {
+        SchedulerKind::CalvinLocking => execute_calvin_batch(core.clone(), batch.clone()).await,
+        SchedulerKind::SccOnline => execute_scc_batch(core.clone(), batch.clone()).await,
+    };
     core.mailboxes.cleanup_batch(batch.batch_id).await;
+    core.scc_completion_reports
+        .cleanup_batch(batch.batch_id)
+        .await;
     result
 }
 
-async fn execute_batch_on_shard_inner(
-    core: Arc<ShardCore>,
-    batch: Batch,
-) -> Result<BatchExecutionSummary> {
+async fn execute_calvin_batch(core: Arc<ShardCore>, batch: Batch) -> Result<BatchExecutionSummary> {
     validate_batch_order(&batch)?;
 
     let mut lock_table = LockTable::new();
@@ -154,7 +198,12 @@ async fn execute_batch_on_shard_inner(
         let remote_rx = if participants.active.contains(&core.shard_id) {
             Some(
                 core.mailboxes
-                    .receiver(batch.batch_id, tx.tx_id, participants.all.len().max(1))
+                    .receiver(
+                        batch.batch_id,
+                        tx.tx_id,
+                        ReadPhase::Calvin,
+                        participants.all.len().max(1),
+                    )
                     .await?,
             )
         } else {
@@ -190,6 +239,170 @@ async fn execute_batch_on_shard_inner(
             WorkerCompletion::Active(record) => tx_results.push(record),
             WorkerCompletion::Passive => {}
         }
+    }
+
+    tx_results.sort_by_key(|record| (record.tx_id, record.shard_id));
+    Ok(BatchExecutionSummary {
+        batch_id: batch.batch_id,
+        shard_id: core.shard_id,
+        tx_results,
+    })
+}
+
+async fn execute_scc_batch(core: Arc<ShardCore>, batch: Batch) -> Result<BatchExecutionSummary> {
+    validate_batch_order(&batch)?;
+    for tx in &batch.txs {
+        validate_sets(tx)?;
+        let result_shard = core
+            .layout
+            .result_shard(tx)
+            .ok_or_else(|| Error::InvalidBatch(format!("tx {} has no result shard", tx.tx_id)))?;
+        if result_shard == core.shard_id {
+            core.client_results.ensure_pending(tx.tx_id).await;
+        } else {
+            core.client_results.mark_not_responsible(tx.tx_id).await;
+        }
+    }
+
+    let plan = Arc::new(build_scc_batch_plan(&batch)?);
+    let commit_seq = Arc::new(CommitSequence::new(batch.txs.len()));
+    let (mut dag_runtime, waiters) = SccDagRuntime::new(&plan);
+    let mut waiters_by_tx: Vec<Option<TxDagWaiters>> = waiters.into_iter().map(Some).collect();
+    let mut completion_rx = core
+        .scc_completion_reports
+        .receiver(batch.batch_id, core.layout.shard_count as usize)
+        .await?;
+
+    let local_write_keys_by_tx: Arc<Vec<BTreeSet<Key>>> = Arc::new(
+        batch
+            .txs
+            .iter()
+            .map(|tx| core.layout.local_write_keys(tx, core.shard_id))
+            .collect(),
+    );
+    let local_read_keys_by_tx: Vec<BTreeSet<Key>> = batch
+        .txs
+        .iter()
+        .map(|tx| core.layout.local_read_keys(tx, core.shard_id))
+        .collect();
+    let local_base_read_keys = local_read_keys_by_tx
+        .iter()
+        .flat_map(|keys| keys.iter().cloned())
+        .collect();
+    let base_read_cache = Arc::new(core.store.read_many(&local_base_read_keys)?);
+
+    let (outcome_tx, mut outcome_rx) = mpsc::channel(batch.txs.len().max(1));
+    let mut relevant_count = 0usize;
+    let mut non_participant_indices = Vec::new();
+
+    for (tx_index, tx) in batch.txs.iter().enumerate() {
+        let local_read_keys = local_read_keys_by_tx[tx_index].clone();
+        let local_write_keys = local_write_keys_by_tx[tx_index].clone();
+        if local_read_keys.is_empty() && local_write_keys.is_empty() {
+            non_participant_indices.push(tx_index);
+            continue;
+        }
+
+        relevant_count += 1;
+        let participants = core.layout.participants(tx);
+        let effect_rx = core
+            .mailboxes
+            .receiver(
+                batch.batch_id,
+                tx.tx_id,
+                ReadPhase::SccEffect,
+                participants.all.len().max(1),
+            )
+            .await?;
+        let condition_rx = core
+            .mailboxes
+            .receiver(
+                batch.batch_id,
+                tx.tx_id,
+                ReadPhase::SccCondition,
+                participants.all.len().max(1),
+            )
+            .await?;
+        let result_shard = core
+            .layout
+            .result_shard(tx)
+            .ok_or_else(|| Error::InvalidBatch(format!("tx {} has no result shard", tx.tx_id)))?;
+        spawn_scc_worker(SccWorker {
+            core: core.clone(),
+            batch_id: batch.batch_id,
+            tx_index,
+            tx: tx.clone(),
+            tx_plan: plan.tx_plans[tx_index].clone(),
+            participants,
+            result_shard,
+            local_read_keys,
+            local_write_keys,
+            local_write_keys_by_tx: local_write_keys_by_tx.clone(),
+            base_read_cache: base_read_cache.clone(),
+            commit_seq: commit_seq.clone(),
+            waiters: waiters_by_tx[tx_index].take().ok_or_else(|| {
+                Error::InvalidBatch(format!("missing SCC waiters for tx index {tx_index}"))
+            })?,
+            effect_rx,
+            condition_rx,
+            outcome_tx: outcome_tx.clone(),
+        });
+    }
+    drop(outcome_tx);
+
+    dag_runtime.start()?;
+    for tx_index in non_participant_indices {
+        commit_seq.set_terminal_once(tx_index, CommitSlotState::NoOp)?;
+        dag_runtime.finish_vertex(tx_index)?;
+    }
+
+    let mut speculative_records = BTreeMap::new();
+    for _ in 0..relevant_count {
+        let outcome = outcome_rx.recv().await.ok_or_else(|| {
+            Error::ChannelClosed(
+                "SCC worker outcome channel closed before batch finished".to_string(),
+            )
+        })?;
+        let completion = outcome.result?;
+        dag_runtime.finish_vertex(outcome.tx_index)?;
+        if let Some(record) = completion.record {
+            speculative_records.insert(outcome.tx_index, record);
+        }
+    }
+    let snapshot = commit_seq.terminal_snapshot();
+    let local_failed_indices = failed_indices_from_snapshot(&snapshot);
+    publish_scc_completion_report(core.clone(), batch.batch_id, local_failed_indices).await?;
+    let global_failed_indices =
+        collect_scc_completion_reports(core.clone(), batch.batch_id, &mut completion_rx).await?;
+    record_scc_reorder(
+        core.clone(),
+        batch.batch_id,
+        batch.txs.len(),
+        &global_failed_indices,
+    )
+    .await?;
+
+    let mut tx_results = Vec::new();
+    for (tx_index, record) in speculative_records {
+        if global_failed_indices.contains(&tx_index) {
+            let tx = &batch.txs[tx_index];
+            if core.layout.result_shard(tx) == Some(core.shard_id) {
+                return Err(Error::InvalidBatch(format!(
+                    "tx {} published speculative success but appears in global failed set",
+                    tx.tx_id
+                )));
+            }
+            continue;
+        }
+        tx_results.push(record);
+    }
+
+    install_scc_successes(core.clone(), &snapshot, &global_failed_indices)?;
+
+    if !global_failed_indices.is_empty() {
+        let fallback_batch = fallback_batch_from_failed_indices(&batch, &global_failed_indices);
+        let fallback_summary = execute_calvin_batch(core.clone(), fallback_batch).await?;
+        tx_results.extend(fallback_summary.tx_results);
     }
 
     tx_results.sort_by_key(|record| (record.tx_id, record.shard_id));
@@ -335,6 +548,8 @@ impl TxWorker {
                 tx_id: self.tx.tx_id,
                 from_shard: self.core.shard_id,
                 reads: read_entries_to_proto(local_reads),
+                phase: read_phase_to_i32(ReadPhase::Calvin),
+                status: local_read_status_to_i32(LocalReadStatus::Ok),
             };
             let mut client = pb::shard_client::ShardClient::connect(endpoint).await?;
             client.local_read_result(request).await?;
@@ -373,6 +588,18 @@ impl TxWorker {
                 return Err(Error::InvalidBatch(format!(
                     "remote read result routed to wrong tx: got batch {} tx {}, expected batch {} tx {}",
                     msg.batch_id, msg.tx_id, self.batch_id, self.tx.tx_id
+                )));
+            }
+            if msg.phase != ReadPhase::Calvin {
+                return Err(Error::InvalidBatch(format!(
+                    "remote read result routed to wrong phase for tx {}: got {:?}",
+                    self.tx.tx_id, msg.phase
+                )));
+            }
+            if msg.status != LocalReadStatus::Ok {
+                return Err(Error::InvalidBatch(format!(
+                    "Calvin read result for tx {} from shard {} has non-ok status {:?}",
+                    self.tx.tx_id, msg.from_shard, msg.status
                 )));
             }
             if !expected_remote.contains(&msg.from_shard) {
@@ -443,17 +670,500 @@ impl TxWorker {
     }
 }
 
+struct SccWorker {
+    core: Arc<ShardCore>,
+    batch_id: BatchId,
+    tx_index: usize,
+    tx: OrderedTx,
+    tx_plan: SccTxPlan,
+    participants: Participants,
+    result_shard: ShardId,
+    local_read_keys: BTreeSet<Key>,
+    local_write_keys: BTreeSet<Key>,
+    local_write_keys_by_tx: Arc<Vec<BTreeSet<Key>>>,
+    base_read_cache: Arc<BTreeMap<Key, ReadValue>>,
+    commit_seq: Arc<CommitSequence>,
+    waiters: TxDagWaiters,
+    effect_rx: mpsc::Receiver<LocalReadResult>,
+    condition_rx: mpsc::Receiver<LocalReadResult>,
+    outcome_tx: mpsc::Sender<SccWorkerOutcome>,
+}
+
+struct SccWorkerOutcome {
+    tx_index: usize,
+    result: Result<SccWorkerCompletion>,
+}
+
+struct SccWorkerCompletion {
+    record: Option<TxResultRecord>,
+}
+
+fn spawn_scc_worker(worker: SccWorker) {
+    tokio::spawn(async move {
+        let tx_index = worker.tx_index;
+        let outcome_tx = worker.outcome_tx.clone();
+        let result = worker.run().await;
+        let _ = outcome_tx.send(SccWorkerOutcome { tx_index, result }).await;
+    });
+}
+
+impl SccWorker {
+    async fn run(mut self) -> Result<SccWorkerCompletion> {
+        (&mut self.waiters.effect_ready).await.map_err(|_| {
+            Error::ChannelClosed(format!(
+                "SCC effect DAG ready channel closed for tx {}",
+                self.tx.tx_id
+            ))
+        })?;
+
+        let effect_local_reads = match self.materialized_read(SccPhase::Effect).await {
+            Ok(reads) => reads,
+            Err(Error::SpeculationFailed(reason)) => {
+                self.send_scc_status(ReadPhase::SccEffect, LocalReadStatus::SpeculationFailed)
+                    .await?;
+                return self.fail(reason);
+            }
+            Err(err) => return Err(err),
+        };
+        self.send_scc_reads(ReadPhase::SccEffect, &effect_local_reads)
+            .await?;
+        let effect_full_reads = match self
+            .collect_scc_full_reads(effect_local_reads, ReadPhase::SccEffect)
+            .await
+        {
+            Ok(reads) => reads,
+            Err(Error::SpeculationFailed(reason)) => return self.fail(reason),
+            Err(err) => return Err(err),
+        };
+
+        let output = execute_deterministic(&self.tx, &effect_full_reads);
+        if classify_actual_path(&self.tx, &output) != Some(self.tx_plan.predicted_path) {
+            let reason = format!(
+                "tx {} actual result {:?} does not match predicted success path {:?}",
+                self.tx.tx_id, output.result, self.tx_plan.predicted_path
+            );
+            return self.fail(reason);
+        }
+        let full_delta = output_to_delta(&self.tx, &effect_full_reads, output)?;
+        let local_delta = filter_delta_to_keys(&full_delta, &self.local_write_keys);
+
+        (&mut self.waiters.condition_ready).await.map_err(|_| {
+            Error::ChannelClosed(format!(
+                "SCC condition DAG ready channel closed for tx {}",
+                self.tx.tx_id
+            ))
+        })?;
+
+        if self.tx_plan.effect_prefix_covers_condition() {
+            return self.commit_success(local_delta).await;
+        }
+
+        let condition_local_reads = match self.materialized_read(SccPhase::Condition).await {
+            Ok(reads) => reads,
+            Err(Error::SpeculationFailed(reason)) => {
+                self.send_scc_status(ReadPhase::SccCondition, LocalReadStatus::SpeculationFailed)
+                    .await?;
+                return self.fail(reason);
+            }
+            Err(err) => return Err(err),
+        };
+        self.send_scc_reads(ReadPhase::SccCondition, &condition_local_reads)
+            .await?;
+        let condition_full_reads = match self
+            .collect_scc_full_reads(condition_local_reads, ReadPhase::SccCondition)
+            .await
+        {
+            Ok(reads) => reads,
+            Err(Error::SpeculationFailed(reason)) => return self.fail(reason),
+            Err(err) => return Err(err),
+        };
+
+        if !check_success_path_condition(
+            &self.tx,
+            self.tx_plan.predicted_path,
+            &condition_full_reads,
+        )? {
+            let reason = format!("tx {} success path condition failed", self.tx.tx_id);
+            return self.fail(reason);
+        }
+
+        self.commit_success(local_delta).await
+    }
+
+    async fn commit_success(&self, local_delta: TxDelta) -> Result<SccWorkerCompletion> {
+        if local_delta.ops.is_empty() {
+            self.commit_seq
+                .set_terminal_once(self.tx_index, CommitSlotState::NoOp)?;
+        } else {
+            self.commit_seq
+                .set_terminal_once(self.tx_index, CommitSlotState::Delta(Arc::new(local_delta)))?;
+        }
+
+        if self.result_shard == self.core.shard_id {
+            self.core
+                .client_results
+                .mark_ready(self.tx.tx_id, TxResult::Ok)
+                .await;
+        }
+
+        let record = self
+            .participants
+            .active
+            .contains(&self.core.shard_id)
+            .then_some(TxResultRecord {
+                tx_id: self.tx.tx_id,
+                shard_id: self.core.shard_id,
+                result: TxResult::Ok,
+            });
+        Ok(SccWorkerCompletion { record })
+    }
+
+    async fn materialized_read(&self, phase: SccPhase) -> Result<BTreeMap<Key, ReadValue>> {
+        materialized_local_read(
+            &self.tx_plan,
+            phase,
+            &self.local_read_keys,
+            &self.local_write_keys_by_tx,
+            &self.base_read_cache,
+            &self.commit_seq,
+        )
+        .await
+    }
+
+    async fn send_scc_reads(
+        &self,
+        phase: ReadPhase,
+        local_reads: &BTreeMap<Key, ReadValue>,
+    ) -> Result<()> {
+        self.send_scc_read_result(phase, LocalReadStatus::Ok, local_reads)
+            .await
+    }
+
+    async fn send_scc_status(&self, phase: ReadPhase, status: LocalReadStatus) -> Result<()> {
+        self.send_scc_read_result(phase, status, &BTreeMap::new())
+            .await
+    }
+
+    async fn send_scc_read_result(
+        &self,
+        phase: ReadPhase,
+        status: LocalReadStatus,
+        local_reads: &BTreeMap<Key, ReadValue>,
+    ) -> Result<()> {
+        for target in &self.participants.all {
+            if *target == self.core.shard_id {
+                continue;
+            }
+            let endpoint = self
+                .core
+                .peer_endpoints
+                .get(target)
+                .ok_or(Error::MissingPeer(*target))?
+                .clone();
+            let request = pb::LocalReadResultRequest {
+                batch_id: self.batch_id,
+                tx_id: self.tx.tx_id,
+                from_shard: self.core.shard_id,
+                reads: if status == LocalReadStatus::Ok {
+                    read_entries_to_proto(local_reads)
+                } else {
+                    Vec::new()
+                },
+                phase: read_phase_to_i32(phase),
+                status: local_read_status_to_i32(status),
+            };
+            let mut client = pb::shard_client::ShardClient::connect(endpoint).await?;
+            client.local_read_result(request).await?;
+        }
+        Ok(())
+    }
+
+    async fn collect_scc_full_reads(
+        &mut self,
+        local_reads: BTreeMap<Key, ReadValue>,
+        phase: ReadPhase,
+    ) -> Result<BTreeMap<Key, ReadValue>> {
+        let mut full_reads = local_reads;
+        let expected_remote: BTreeSet<ShardId> = self
+            .participants
+            .all
+            .iter()
+            .copied()
+            .filter(|shard| *shard != self.core.shard_id)
+            .collect();
+        let remote_rx = match phase {
+            ReadPhase::SccEffect => &mut self.effect_rx,
+            ReadPhase::SccCondition => &mut self.condition_rx,
+            _ => {
+                return Err(Error::InvalidBatch(format!(
+                    "invalid SCC read phase {:?}",
+                    phase
+                )))
+            }
+        };
+        let mut received = BTreeSet::new();
+        while received.len() < expected_remote.len() {
+            let msg = remote_rx.recv().await.ok_or_else(|| {
+                Error::ChannelClosed(format!(
+                    "SCC remote read mailbox closed for tx {} phase {:?}",
+                    self.tx.tx_id, phase
+                ))
+            })?;
+            if msg.batch_id != self.batch_id || msg.tx_id != self.tx.tx_id || msg.phase != phase {
+                return Err(Error::InvalidBatch(format!(
+                    "SCC read result routed to wrong target: got batch {} tx {} phase {:?}, expected batch {} tx {} phase {:?}",
+                    msg.batch_id, msg.tx_id, msg.phase, self.batch_id, self.tx.tx_id, phase
+                )));
+            }
+            if !expected_remote.contains(&msg.from_shard) {
+                return Err(Error::InvalidBatch(format!(
+                    "unexpected SCC read result for tx {} phase {:?} from shard {}",
+                    self.tx.tx_id, phase, msg.from_shard
+                )));
+            }
+            if !received.insert(msg.from_shard) {
+                return Err(Error::InvalidBatch(format!(
+                    "duplicate SCC read result for tx {} phase {:?} from shard {}",
+                    self.tx.tx_id, phase, msg.from_shard
+                )));
+            }
+            if msg.status == LocalReadStatus::SpeculationFailed {
+                return Err(Error::SpeculationFailed(format!(
+                    "tx {} phase {:?} received speculation failure from shard {}",
+                    self.tx.tx_id, phase, msg.from_shard
+                )));
+            }
+            if msg.status != LocalReadStatus::Ok {
+                return Err(Error::InvalidBatch(format!(
+                    "tx {} phase {:?} got invalid local read status {:?}",
+                    self.tx.tx_id, phase, msg.status
+                )));
+            }
+
+            let expected_keys = self.core.layout.local_read_keys(&self.tx, msg.from_shard);
+            let actual_keys: BTreeSet<Key> = msg.reads.keys().cloned().collect();
+            if actual_keys != expected_keys {
+                return Err(Error::InvalidBatch(format!(
+                    "tx {} phase {:?} read keys from shard {} mismatch: expected {:?}, got {:?}",
+                    self.tx.tx_id, phase, msg.from_shard, expected_keys, actual_keys
+                )));
+            }
+            for (key, value) in msg.reads {
+                if full_reads.insert(key.clone(), value).is_some() {
+                    return Err(Error::InvalidBatch(format!(
+                        "duplicate SCC full read key {} for tx {} phase {:?}",
+                        key, self.tx.tx_id, phase
+                    )));
+                }
+            }
+        }
+
+        let full_keys: BTreeSet<Key> = full_reads.keys().cloned().collect();
+        if full_keys != self.tx.read_set {
+            return Err(Error::InvalidBatch(format!(
+                "tx {} phase {:?} full read set mismatch: expected {:?}, got {:?}",
+                self.tx.tx_id, phase, self.tx.read_set, full_keys
+            )));
+        }
+        Ok(full_reads)
+    }
+
+    fn fail(self, reason: String) -> Result<SccWorkerCompletion> {
+        self.commit_seq
+            .set_terminal_once(self.tx_index, CommitSlotState::Failed)?;
+        tracing::debug!("SCC tx {} failed speculation: {}", self.tx.tx_id, reason);
+        Ok(SccWorkerCompletion { record: None })
+    }
+}
+
+async fn record_scc_reorder(
+    core: Arc<ShardCore>,
+    batch_id: BatchId,
+    batch_len: usize,
+    global_failed_indices: &BTreeSet<usize>,
+) -> Result<()> {
+    let all_indices: BTreeSet<usize> = (0..batch_len).collect();
+    if !global_failed_indices.is_subset(&all_indices) {
+        return Err(Error::InvalidBatch(format!(
+            "SCC global failed set {:?} contains index outside batch length {}",
+            global_failed_indices, batch_len
+        )));
+    }
+    let speculative_success_indices = all_indices
+        .difference(global_failed_indices)
+        .copied()
+        .collect();
+    let fallback_indices = global_failed_indices.iter().copied().collect();
+    let record = SccReorderRecord {
+        batch_id,
+        speculative_success_indices,
+        fallback_indices,
+    };
+    let mut reorders = core.scc_reorders.lock().await;
+    if reorders.insert(batch_id, record).is_some() {
+        return Err(Error::InvalidBatch(format!(
+            "duplicate SCC reorder record for batch {}",
+            batch_id
+        )));
+    }
+    Ok(())
+}
+
+fn failed_indices_from_snapshot(snapshot: &[CommitSlotState]) -> BTreeSet<usize> {
+    snapshot
+        .iter()
+        .enumerate()
+        .filter_map(|(index, state)| matches!(state, CommitSlotState::Failed).then_some(index))
+        .collect()
+}
+
+async fn publish_scc_completion_report(
+    core: Arc<ShardCore>,
+    batch_id: BatchId,
+    failed_tx_indices: BTreeSet<usize>,
+) -> Result<()> {
+    core.scc_completion_reports
+        .route(SccCompletionReport {
+            batch_id,
+            from_shard: core.shard_id,
+            failed_tx_indices: failed_tx_indices.clone(),
+        })
+        .await?;
+
+    let from_shard = core.shard_id;
+    let peers: Vec<String> = core
+        .peer_endpoints
+        .iter()
+        .filter_map(|(peer, endpoint)| (*peer != from_shard).then_some(endpoint.clone()))
+        .collect();
+    let mut handles = Vec::new();
+    for endpoint in peers {
+        let endpoint = endpoint.clone();
+        let failed_tx_indices = failed_tx_indices.clone();
+        handles.push(tokio::spawn(async move {
+            let mut client = pb::shard_client::ShardClient::connect(endpoint).await?;
+            client
+                .report_scc_completion(pb::SccCompletionReportRequest {
+                    batch_id,
+                    from_shard,
+                    failed_tx_indices: failed_tx_indices
+                        .into_iter()
+                        .map(|index| index as u32)
+                        .collect(),
+                })
+                .await?;
+            Ok::<_, Error>(())
+        }));
+    }
+
+    for handle in handles {
+        handle
+            .await
+            .map_err(|err| Error::TaskJoin(err.to_string()))??;
+    }
+    Ok(())
+}
+
+async fn collect_scc_completion_reports(
+    core: Arc<ShardCore>,
+    batch_id: BatchId,
+    completion_rx: &mut mpsc::Receiver<SccCompletionReport>,
+) -> Result<BTreeSet<usize>> {
+    let expected: BTreeSet<ShardId> = (0..core.layout.shard_count).collect();
+    let mut reports: BTreeMap<ShardId, BTreeSet<usize>> = BTreeMap::new();
+    while reports.len() < expected.len() {
+        let report = completion_rx.recv().await.ok_or_else(|| {
+            Error::ChannelClosed(format!(
+                "SCC completion report channel closed for batch {}",
+                batch_id
+            ))
+        })?;
+        if report.batch_id != batch_id {
+            return Err(Error::InvalidBatch(format!(
+                "SCC completion report routed to wrong batch: got {}, expected {}",
+                report.batch_id, batch_id
+            )));
+        }
+        if !expected.contains(&report.from_shard) {
+            return Err(Error::InvalidBatch(format!(
+                "SCC completion report from unexpected shard {}",
+                report.from_shard
+            )));
+        }
+        if reports
+            .insert(report.from_shard, report.failed_tx_indices)
+            .is_some()
+        {
+            return Err(Error::InvalidBatch(format!(
+                "duplicate SCC completion report from shard {}",
+                report.from_shard
+            )));
+        }
+    }
+
+    Ok(reports.into_values().flatten().collect())
+}
+
+fn install_scc_successes(
+    core: Arc<ShardCore>,
+    snapshot: &[CommitSlotState],
+    global_failed_indices: &BTreeSet<usize>,
+) -> Result<()> {
+    for (tx_index, state) in snapshot.iter().enumerate() {
+        if global_failed_indices.contains(&tx_index) {
+            continue;
+        }
+        match state {
+            CommitSlotState::Pending => {
+                return Err(Error::InvalidBatch(format!(
+                    "SCC commit slot {} is still pending at install",
+                    tx_index
+                )))
+            }
+            CommitSlotState::Failed => {
+                return Err(Error::InvalidBatch(format!(
+                    "SCC commit slot {} failed but is absent from global failed set",
+                    tx_index
+                )))
+            }
+            CommitSlotState::NoOp => {}
+            CommitSlotState::Delta(delta) => {
+                core.store.apply_delta_atomically(delta)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn fallback_batch_from_failed_indices(batch: &Batch, failed_indices: &BTreeSet<usize>) -> Batch {
+    let txs = failed_indices
+        .iter()
+        .enumerate()
+        .map(|(fallback_index, original_index)| {
+            let mut tx = batch.txs[*original_index].clone();
+            tx.batch_index = fallback_index as u32;
+            tx
+        })
+        .collect();
+    Batch {
+        batch_id: batch.batch_id,
+        txs,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct LocalReadResult {
     pub batch_id: BatchId,
     pub tx_id: TxId,
+    pub phase: ReadPhase,
     pub from_shard: ShardId,
+    pub status: LocalReadStatus,
     pub reads: BTreeMap<Key, ReadValue>,
 }
 
 #[derive(Clone)]
 pub struct ReadResultMailboxRegistry {
-    inner: Arc<Mutex<BTreeMap<(BatchId, TxId), MailboxEntry>>>,
+    inner: Arc<Mutex<BTreeMap<(BatchId, TxId, ReadPhase), MailboxEntry>>>,
 }
 
 struct MailboxEntry {
@@ -472,16 +1182,17 @@ impl ReadResultMailboxRegistry {
         &self,
         batch_id: BatchId,
         tx_id: TxId,
+        phase: ReadPhase,
         capacity: usize,
     ) -> Result<mpsc::Receiver<LocalReadResult>> {
         let mut inner = self.inner.lock().await;
         let entry = inner
-            .entry((batch_id, tx_id))
+            .entry((batch_id, tx_id, phase))
             .or_insert_with(|| new_mailbox(capacity.max(1)));
         entry.receiver.take().ok_or_else(|| {
             Error::InvalidBatch(format!(
-                "remote read receiver already taken for batch {} tx {}",
-                batch_id, tx_id
+                "remote read receiver already taken for batch {} tx {} phase {:?}",
+                batch_id, tx_id, phase
             ))
         })
     }
@@ -490,7 +1201,7 @@ impl ReadResultMailboxRegistry {
         let sender = {
             let mut inner = self.inner.lock().await;
             inner
-                .entry((result.batch_id, result.tx_id))
+                .entry((result.batch_id, result.tx_id, result.phase))
                 .or_insert_with(|| new_mailbox(DEFAULT_MAILBOX_CAPACITY))
                 .sender
                 .clone()
@@ -503,13 +1214,82 @@ impl ReadResultMailboxRegistry {
 
     pub async fn cleanup_batch(&self, batch_id: BatchId) {
         let mut inner = self.inner.lock().await;
-        inner.retain(|(entry_batch_id, _), _| *entry_batch_id != batch_id);
+        inner.retain(|(entry_batch_id, _, _), _| *entry_batch_id != batch_id);
     }
 }
 
 fn new_mailbox(capacity: usize) -> MailboxEntry {
     let (sender, receiver) = mpsc::channel(capacity);
     MailboxEntry {
+        sender,
+        receiver: Some(receiver),
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SccCompletionReport {
+    pub batch_id: BatchId,
+    pub from_shard: ShardId,
+    pub failed_tx_indices: BTreeSet<usize>,
+}
+
+#[derive(Clone)]
+pub struct SccCompletionReportRegistry {
+    inner: Arc<Mutex<BTreeMap<BatchId, SccCompletionReportEntry>>>,
+}
+
+struct SccCompletionReportEntry {
+    sender: mpsc::Sender<SccCompletionReport>,
+    receiver: Option<mpsc::Receiver<SccCompletionReport>>,
+}
+
+impl SccCompletionReportRegistry {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+
+    pub async fn receiver(
+        &self,
+        batch_id: BatchId,
+        capacity: usize,
+    ) -> Result<mpsc::Receiver<SccCompletionReport>> {
+        let mut inner = self.inner.lock().await;
+        let entry = inner
+            .entry(batch_id)
+            .or_insert_with(|| new_completion_report_entry(capacity.max(1)));
+        entry.receiver.take().ok_or_else(|| {
+            Error::InvalidBatch(format!(
+                "SCC completion report receiver already taken for batch {}",
+                batch_id
+            ))
+        })
+    }
+
+    pub async fn route(&self, report: SccCompletionReport) -> Result<()> {
+        let sender = {
+            let mut inner = self.inner.lock().await;
+            inner
+                .entry(report.batch_id)
+                .or_insert_with(|| new_completion_report_entry(DEFAULT_MAILBOX_CAPACITY))
+                .sender
+                .clone()
+        };
+        sender.send(report).await.map_err(|_| {
+            Error::ChannelClosed("SCC completion report receiver is closed".to_string())
+        })
+    }
+
+    pub async fn cleanup_batch(&self, batch_id: BatchId) {
+        let mut inner = self.inner.lock().await;
+        inner.remove(&batch_id);
+    }
+}
+
+fn new_completion_report_entry(capacity: usize) -> SccCompletionReportEntry {
+    let (sender, receiver) = mpsc::channel(capacity);
+    SccCompletionReportEntry {
         sender,
         receiver: Some(receiver),
     }

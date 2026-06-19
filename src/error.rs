@@ -37,6 +37,8 @@ pub enum Error {
     TaskJoin(String),
     #[error("lock invariant violation: {0}")]
     LockInvariant(String),
+    #[error("speculation failed: {0}")]
+    SpeculationFailed(String),
     #[error("missing peer shard {0}")]
     MissingPeer(ShardId),
     #[error("missing batch {0}")]

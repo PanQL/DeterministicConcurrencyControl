@@ -148,6 +148,19 @@ pub enum ReadValue {
     Missing,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum ReadPhase {
+    Calvin,
+    SccEffect,
+    SccCondition,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalReadStatus {
+    Ok,
+    SpeculationFailed,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WriteOp {
     Put { key: Key, value: Inode },
@@ -173,6 +186,13 @@ pub struct TxResultRecord {
     pub tx_id: TxId,
     pub shard_id: ShardId,
     pub result: TxResult,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SccReorderRecord {
+    pub batch_id: BatchId,
+    pub speculative_success_indices: Vec<usize>,
+    pub fallback_indices: Vec<usize>,
 }
 
 pub fn parent_key(path: &Key) -> Result<Key> {

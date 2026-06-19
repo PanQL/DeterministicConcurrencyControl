@@ -1,7 +1,8 @@
 use crate::error::{Error, Result};
 use crate::executor::execute_deterministic;
 use crate::model::{
-    Batch, Inode, Key, ReadValue, ShardId, TxId, TxResult, TxResultRecord, WriteOp,
+    Batch, BatchId, Inode, Key, ReadValue, SccReorderRecord, ShardId, TxId, TxResult,
+    TxResultRecord, WriteOp,
 };
 use crate::router::ShardLayout;
 use std::collections::{BTreeMap, BTreeSet};
@@ -10,23 +11,62 @@ pub fn reference_execute_batches(batches: &[Batch]) -> BTreeMap<Key, Inode> {
     let mut state = BTreeMap::new();
     for batch in batches {
         for tx in &batch.txs {
-            let reads = tx
-                .read_set
-                .iter()
-                .map(|key| {
-                    let value = state
-                        .get(key)
-                        .cloned()
-                        .map(ReadValue::Present)
-                        .unwrap_or(ReadValue::Missing);
-                    (key.clone(), value)
-                })
-                .collect();
-            let output = execute_deterministic(tx, &reads);
-            apply_writes(&mut state, output.writes);
+            apply_reference_tx(&mut state, tx);
         }
     }
     state
+}
+
+pub fn reference_execute_scc_reordered_batches(
+    batches: &[Batch],
+    reorders: &BTreeMap<BatchId, SccReorderRecord>,
+) -> Result<BTreeMap<Key, Inode>> {
+    let mut state = BTreeMap::new();
+    for batch in batches {
+        let reorder = reorders.get(&batch.batch_id).ok_or_else(|| {
+            Error::Checker(format!(
+                "missing SCC reorder record for batch {}",
+                batch.batch_id
+            ))
+        })?;
+        validate_reorder_record(batch, reorder)?;
+        for index in reorder
+            .speculative_success_indices
+            .iter()
+            .chain(reorder.fallback_indices.iter())
+        {
+            apply_reference_tx(&mut state, &batch.txs[*index]);
+        }
+    }
+    Ok(state)
+}
+
+pub fn assert_scc_reorders_consistent(
+    shard_reorders: Vec<(ShardId, Vec<SccReorderRecord>)>,
+) -> Result<BTreeMap<BatchId, SccReorderRecord>> {
+    let mut expected: Option<(ShardId, BTreeMap<BatchId, SccReorderRecord>)> = None;
+    for (shard_id, records) in shard_reorders {
+        let mut by_batch = BTreeMap::new();
+        for record in records {
+            if by_batch.insert(record.batch_id, record).is_some() {
+                return Err(Error::Checker(format!(
+                    "shard {} reported duplicate SCC reorder for a batch",
+                    shard_id
+                )));
+            }
+        }
+        if let Some((expected_shard, expected_records)) = &expected {
+            if &by_batch != expected_records {
+                return Err(Error::Checker(format!(
+                    "SCC reorder mismatch between shard {} and shard {}: expected {:?}, got {:?}",
+                    expected_shard, shard_id, expected_records, by_batch
+                )));
+            }
+        } else {
+            expected = Some((shard_id, by_batch));
+        }
+    }
+    Ok(expected.map(|(_, records)| records).unwrap_or_default())
 }
 
 pub fn merge_shard_states(
@@ -113,6 +153,60 @@ pub fn assert_tx_results_consistent(
         }
     }
     Ok(())
+}
+
+fn validate_reorder_record(batch: &Batch, reorder: &SccReorderRecord) -> Result<()> {
+    if reorder.batch_id != batch.batch_id {
+        return Err(Error::Checker(format!(
+            "SCC reorder batch id mismatch: record {}, batch {}",
+            reorder.batch_id, batch.batch_id
+        )));
+    }
+    let batch_len = batch.txs.len();
+    let mut seen = BTreeSet::new();
+    for index in reorder
+        .speculative_success_indices
+        .iter()
+        .chain(reorder.fallback_indices.iter())
+    {
+        if *index >= batch_len {
+            return Err(Error::Checker(format!(
+                "SCC reorder for batch {} contains out-of-range index {} for len {}",
+                batch.batch_id, index, batch_len
+            )));
+        }
+        if !seen.insert(*index) {
+            return Err(Error::Checker(format!(
+                "SCC reorder for batch {} contains duplicate index {}",
+                batch.batch_id, index
+            )));
+        }
+    }
+    let expected: BTreeSet<usize> = (0..batch_len).collect();
+    if seen != expected {
+        return Err(Error::Checker(format!(
+            "SCC reorder for batch {} does not cover every tx index: expected {:?}, got {:?}",
+            batch.batch_id, expected, seen
+        )));
+    }
+    Ok(())
+}
+
+fn apply_reference_tx(state: &mut BTreeMap<Key, Inode>, tx: &crate::model::OrderedTx) {
+    let reads = tx
+        .read_set
+        .iter()
+        .map(|key| {
+            let value = state
+                .get(key)
+                .cloned()
+                .map(ReadValue::Present)
+                .unwrap_or(ReadValue::Missing);
+            (key.clone(), value)
+        })
+        .collect();
+    let output = execute_deterministic(tx, &reads);
+    apply_writes(state, output.writes);
 }
 
 fn apply_writes(state: &mut BTreeMap<Key, Inode>, writes: Vec<WriteOp>) {
