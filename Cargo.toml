@@ -3,6 +3,7 @@ name = "calvinfs-demo"
 version = "0.1.0"
 edition = "2021"
 build = "build.rs"
+publish = false
 
 [lib]
 name = "calvinfs_demo"
@@ -11,8 +12,10 @@ path = "src/lib.rs"
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(madsim)'] }
 
+[package.metadata.cargo-machete]
+ignored = ["bytes", "prost"]
+
 [dependencies]
-async-trait = "0.1"
 bincode = "1"
 bytes = "1"
 prost = "0.13"

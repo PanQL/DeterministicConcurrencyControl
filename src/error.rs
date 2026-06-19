@@ -30,7 +30,7 @@ pub enum Error {
     #[error("tonic transport error: {0}")]
     TonicTransport(#[from] tonic::transport::Error),
     #[error("tonic status: {0}")]
-    TonicStatus(#[from] tonic::Status),
+    TonicStatus(#[source] Box<tonic::Status>),
     #[error("channel closed: {0}")]
     ChannelClosed(String),
     #[error("task join error: {0}")]
@@ -47,6 +47,12 @@ pub enum Error {
     MissingTx(TxId),
     #[error("checker failure: {0}")]
     Checker(String),
+}
+
+impl From<tonic::Status> for Error {
+    fn from(value: tonic::Status) -> Self {
+        Self::TonicStatus(Box::new(value))
+    }
 }
 
 impl From<Error> for tonic::Status {

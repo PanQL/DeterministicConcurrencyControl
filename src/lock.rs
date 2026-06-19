@@ -78,6 +78,12 @@ impl LockTable {
     }
 }
 
+impl Default for LockTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 async fn send_grant(entry: &LockQueueEntry, key: &Key) -> Result<()> {
     entry
         .grant_tx

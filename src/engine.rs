@@ -28,16 +28,11 @@ const DEFAULT_MAILBOX_CAPACITY: usize = 1024;
 const SEQUENCER_COMMAND_CAPACITY: usize = 1024;
 const DEFAULT_BATCH_FLUSH_INTERVAL: Duration = Duration::from_millis(1);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum SchedulerKind {
+    #[default]
     CalvinLocking,
     SccOnline,
-}
-
-impl Default for SchedulerKind {
-    fn default() -> Self {
-        Self::CalvinLocking
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -1163,8 +1158,11 @@ pub struct LocalReadResult {
 
 #[derive(Clone)]
 pub struct ReadResultMailboxRegistry {
-    inner: Arc<Mutex<BTreeMap<(BatchId, TxId, ReadPhase), MailboxEntry>>>,
+    inner: Arc<Mutex<ReadResultMailboxMap>>,
 }
+
+type ReadResultMailboxKey = (BatchId, TxId, ReadPhase);
+type ReadResultMailboxMap = BTreeMap<ReadResultMailboxKey, MailboxEntry>;
 
 struct MailboxEntry {
     sender: mpsc::Sender<LocalReadResult>,
@@ -1215,6 +1213,12 @@ impl ReadResultMailboxRegistry {
     pub async fn cleanup_batch(&self, batch_id: BatchId) {
         let mut inner = self.inner.lock().await;
         inner.retain(|(entry_batch_id, _, _), _| *entry_batch_id != batch_id);
+    }
+}
+
+impl Default for ReadResultMailboxRegistry {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1284,6 +1288,12 @@ impl SccCompletionReportRegistry {
     pub async fn cleanup_batch(&self, batch_id: BatchId) {
         let mut inner = self.inner.lock().await;
         inner.remove(&batch_id);
+    }
+}
+
+impl Default for SccCompletionReportRegistry {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1366,6 +1376,12 @@ impl TxResultRegistry {
                 .clone()
         };
         sender.send_replace(state);
+    }
+}
+
+impl Default for TxResultRegistry {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

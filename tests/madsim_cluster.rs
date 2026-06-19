@@ -638,7 +638,7 @@ async fn run_submit_tx_driver(
     wait_for_shards(&shard_endpoints).await?;
     wait_for_sequencer(&sequencer_endpoint).await?;
 
-    let expected_ops = vec![
+    let expected_ops = [
         expect("submit_tx:mkdir_root", mkdir("/")?, TxResult::Ok),
         expect("submit_tx:mkdir_client", mkdir("/client")?, TxResult::Ok),
         expect(
@@ -1115,7 +1115,7 @@ async fn run_mdtest_phase(
         let start_barrier = start_barrier.clone();
         let end_barrier = end_barrier.clone();
         handles.push(tokio::spawn(async move {
-            run_mdtest_rank_phase(
+            run_mdtest_rank_phase(MdtestRankPhaseInput {
                 phase,
                 mode,
                 config,
@@ -1124,7 +1124,7 @@ async fn run_mdtest_phase(
                 shard_endpoints,
                 start_barrier,
                 end_barrier,
-            )
+            })
             .await
         }));
     }
@@ -1137,7 +1137,7 @@ async fn run_mdtest_phase(
     Ok(results)
 }
 
-async fn run_mdtest_rank_phase(
+struct MdtestRankPhaseInput {
     phase: MdtestPhase,
     mode: MdtestMode,
     config: MdtestConfig,
@@ -1146,7 +1146,20 @@ async fn run_mdtest_rank_phase(
     shard_endpoints: BTreeMap<ShardId, String>,
     start_barrier: Arc<tokio::sync::Barrier>,
     end_barrier: Arc<tokio::sync::Barrier>,
-) -> Result<RankPhaseResult> {
+}
+
+async fn run_mdtest_rank_phase(input: MdtestRankPhaseInput) -> Result<RankPhaseResult> {
+    let MdtestRankPhaseInput {
+        phase,
+        mode,
+        config,
+        rank,
+        sequencer_endpoint,
+        shard_endpoints,
+        start_barrier,
+        end_barrier,
+    } = input;
+
     let ops = phase.operations_for_rank(mode, &config, rank)?;
     let mut sequencer = pb::sequencer_client::SequencerClient::connect(sequencer_endpoint).await?;
     let mut shard_clients = connect_shard_clients(&shard_endpoints).await?;

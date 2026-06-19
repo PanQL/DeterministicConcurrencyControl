@@ -39,8 +39,8 @@ impl pb::shard_server::Shard for ShardService {
         let request = request.into_inner();
         let batch = request
             .batch
-            .ok_or_else(|| Status::invalid_argument("missing batch"))
-            .and_then(|batch| batch_from_proto(batch).map_err(Status::from))?;
+            .ok_or_else(|| Status::invalid_argument("missing batch"))?;
+        let batch = batch_from_proto(batch).map_err(Status::from)?;
         let summary = self
             .runtime
             .execute_batch(batch)
