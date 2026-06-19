@@ -16,16 +16,20 @@ use calvinfs_demo::router::ShardLayout;
 use calvinfs_demo::service::{sequencer_service, shard_service};
 use calvinfs_demo::workload::metadata_workload;
 use std::collections::{BTreeMap, BTreeSet};
+use std::env;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tonic::transport::Server;
 
 const SHARD_COUNT: u64 = 4;
 const BATCH_COUNT: usize = 16;
 const BATCH_SIZE: usize = 512;
-const PARALLEL_CLIENT_COUNT: usize = 16;
-const CREATES_PER_PARALLEL_CLIENT: usize = BATCH_SIZE;
+const MDTEST_DEFAULT_CLIENT_COUNT: usize = 8;
+const MDTEST_DEFAULT_DIRS_PER_CLIENT: usize = 4;
+const MDTEST_DEFAULT_FILES_PER_CLIENT: usize = 64;
+const MDTEST_PRIVATE_ROOT: &str = "/mdtest_private";
+const MDTEST_PUBLIC_ROOT: &str = "/mdtest_public";
 const SHARD_PORT: u16 = 50_051;
 const SEQUENCER_PORT: u16 = 50_052;
 
@@ -88,37 +92,19 @@ async fn submit_tx_get_result_client_api() -> Result<()> {
 }
 
 #[madsim::test]
-async fn submit_tx_parallel_clients_create_full_batches() -> Result<()> {
-    let mut shard_endpoints = BTreeMap::new();
-    for shard_id in 0..SHARD_COUNT {
-        let ip = shard_ip(shard_id);
-        shard_endpoints.insert(shard_id, endpoint(ip, SHARD_PORT));
-    }
-    for shard_id in 0..SHARD_COUNT {
-        let ip = shard_ip(shard_id);
-        start_shard_node(shard_id, ip, shard_endpoints.clone());
-    }
-
-    let sequencer_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 100));
-    let sequencer_endpoint = endpoint(sequencer_ip, SEQUENCER_PORT);
-    start_sequencer_node_with_flush_interval(
-        sequencer_ip,
-        shard_endpoints.clone(),
-        Duration::from_secs(60),
+async fn mdtest_like_client_workload() -> Result<()> {
+    let config = MdtestConfig::from_env()?;
+    println!(
+        "\nCalvinFS mdtest-like workload: clients={} dirs/client={} files/client={} batch_size={}",
+        config.client_count, config.dirs_per_client, config.files_per_client, config.batch_size
     );
 
-    let driver = madsim::runtime::Handle::current()
-        .create_node()
-        .name("parallel-submit-tx-driver")
-        .ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 202)))
-        .build();
-    driver
-        .spawn(run_parallel_submit_tx_driver(
-            sequencer_endpoint,
-            shard_endpoints,
-        ))
-        .await
-        .expect("parallel submit tx driver task panicked")?;
+    let private_summary = run_mdtest_like_cluster(MdtestMode::Private, config, 20).await?;
+    let public_summary = run_mdtest_like_cluster(MdtestMode::Public, config, 30).await?;
+
+    print_mode_summary(&private_summary, config.show_ranks);
+    print_mode_summary(&public_summary, config.show_ranks);
+    print_comparison_summary(&private_summary, &public_summary);
 
     Ok(())
 }
@@ -321,104 +307,368 @@ async fn run_submit_tx_driver(
     Ok(())
 }
 
-async fn run_parallel_submit_tx_driver(
+async fn run_mdtest_like_cluster(
+    mode: MdtestMode,
+    config: MdtestConfig,
+    network: u8,
+) -> Result<ModeSummary> {
+    let mut shard_endpoints = BTreeMap::new();
+    for shard_id in 0..SHARD_COUNT {
+        let ip = mdtest_shard_ip(network, shard_id);
+        shard_endpoints.insert(shard_id, endpoint(ip, SHARD_PORT));
+    }
+    for shard_id in 0..SHARD_COUNT {
+        let ip = mdtest_shard_ip(network, shard_id);
+        start_shard_node_with_name(
+            format!("mdtest-{}-shard-{shard_id}", mode.name()),
+            shard_id,
+            ip,
+            shard_endpoints.clone(),
+        );
+    }
+
+    let sequencer_ip = mdtest_node_ip(network, 100);
+    let sequencer_endpoint = endpoint(sequencer_ip, SEQUENCER_PORT);
+    start_sequencer_node_with_config_and_name(
+        format!("mdtest-{}-sequencer", mode.name()),
+        sequencer_ip,
+        shard_endpoints.clone(),
+        config.batch_size,
+        SequencerConfig::default_batch_flush_interval(),
+    );
+
+    let driver = madsim::runtime::Handle::current()
+        .create_node()
+        .name(format!("mdtest-{}-driver", mode.name()))
+        .ip(mdtest_node_ip(network, 200))
+        .build();
+    driver
+        .spawn(run_mdtest_like_client_driver(
+            mode,
+            sequencer_endpoint,
+            shard_endpoints,
+            config,
+        ))
+        .await
+        .expect("mdtest-like driver task panicked")
+}
+
+async fn run_mdtest_like_client_driver(
+    mode: MdtestMode,
     sequencer_endpoint: String,
     shard_endpoints: BTreeMap<ShardId, String>,
-) -> Result<()> {
+    config: MdtestConfig,
+) -> Result<ModeSummary> {
     wait_for_shards(&shard_endpoints).await?;
     wait_for_sequencer(&sequencer_endpoint).await?;
 
-    let layout = ShardLayout::new(SHARD_COUNT);
     let mut sequencer =
         pb::sequencer_client::SequencerClient::connect(sequencer_endpoint.clone()).await?;
-    let mut reference_batches = Vec::new();
-    let mut all_records = Vec::new();
-
-    submit_expected_batch(
+    submit_client_tx(
         &mut sequencer,
-        vec![
-            expect("parallel_setup:mkdir_root", mkdir("/")?, TxResult::Ok),
-            expect(
-                "parallel_setup:mkdir_parallel",
-                mkdir("/parallel")?,
-                TxResult::Ok,
-            ),
-        ],
-        &mut reference_batches,
-        &mut all_records,
+        &shard_endpoints,
+        "mdtest:setup:mkdir_root",
+        mkdir("/")?,
+        TxResult::Ok,
     )
     .await?;
 
-    let mut handles = Vec::new();
-    for client_id in 0..PARALLEL_CLIENT_COUNT {
-        let endpoint = sequencer_endpoint.clone();
-        handles.push(tokio::spawn(async move {
-            let mut client = pb::sequencer_client::SequencerClient::connect(endpoint).await?;
-            let mut submitted = Vec::with_capacity(CREATES_PER_PARALLEL_CLIENT);
-            for file_id in 0..CREATES_PER_PARALLEL_CLIENT {
-                let label = format!("parallel_client:{client_id}:{file_id}");
-                let op = create(&format!("/parallel/client_{client_id}_file_{file_id}"))?;
-                let response = client
-                    .submit_tx(pb::SubmitTxRequest {
-                        op: Some(fs_op_to_proto(&op)),
-                    })
-                    .await?
-                    .into_inner();
-                submitted.push(SubmittedClientTx {
-                    label,
-                    op,
-                    expected: TxResult::Ok,
-                    tx_id: response.tx_id,
-                    result_shard: response.result_shard,
-                });
+    let summary = run_mdtest_mode(mode, &config, &sequencer_endpoint, &shard_endpoints).await?;
+
+    submit_client_tx(
+        &mut sequencer,
+        &shard_endpoints,
+        "mdtest:sanity:stat_root",
+        stat("/")?,
+        TxResult::Ok,
+    )
+    .await?;
+    submit_client_tx(
+        &mut sequencer,
+        &shard_endpoints,
+        &format!("mdtest:sanity:stat_{}_removed", mode.name()),
+        stat(mode.root())?,
+        TxResult::NotFound,
+    )
+    .await?;
+
+    Ok(summary)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MdtestMode {
+    Private,
+    Public,
+}
+
+impl MdtestMode {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Private => "private",
+            Self::Public => "public",
+        }
+    }
+
+    fn root(self) -> &'static str {
+        match self {
+            Self::Private => MDTEST_PRIVATE_ROOT,
+            Self::Public => MDTEST_PUBLIC_ROOT,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MdtestConfig {
+    client_count: usize,
+    dirs_per_client: usize,
+    files_per_client: usize,
+    batch_size: usize,
+    show_ranks: bool,
+}
+
+impl MdtestConfig {
+    fn from_env() -> Result<Self> {
+        Ok(Self {
+            client_count: read_positive_usize_env(
+                "CALVINFS_MDTEST_CLIENTS",
+                MDTEST_DEFAULT_CLIENT_COUNT,
+            )?,
+            dirs_per_client: read_positive_usize_env(
+                "CALVINFS_MDTEST_DIRS_PER_CLIENT",
+                MDTEST_DEFAULT_DIRS_PER_CLIENT,
+            )?,
+            files_per_client: read_positive_usize_env(
+                "CALVINFS_MDTEST_FILES_PER_CLIENT",
+                MDTEST_DEFAULT_FILES_PER_CLIENT,
+            )?,
+            batch_size: read_positive_usize_env("CALVINFS_MDTEST_BATCH_SIZE", BATCH_SIZE)?,
+            show_ranks: read_bool_env("CALVINFS_MDTEST_SHOW_RANKS", false)?,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MdtestPhase {
+    DirectoryCreation,
+    DirectoryStat,
+    FileCreation,
+    FileStat,
+    FileRemoval,
+    DirectoryRemoval,
+}
+
+impl MdtestPhase {
+    fn all() -> [Self; 6] {
+        [
+            Self::DirectoryCreation,
+            Self::DirectoryStat,
+            Self::FileCreation,
+            Self::FileStat,
+            Self::FileRemoval,
+            Self::DirectoryRemoval,
+        ]
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::DirectoryCreation => "Directory creation",
+            Self::DirectoryStat => "Directory stat",
+            Self::FileCreation => "File creation",
+            Self::FileStat => "File stat",
+            Self::FileRemoval => "File removal",
+            Self::DirectoryRemoval => "Directory removal",
+        }
+    }
+
+    fn operations_for_rank(
+        self,
+        mode: MdtestMode,
+        config: &MdtestConfig,
+        rank: usize,
+    ) -> Result<Vec<FsOp>> {
+        let mut ops = Vec::new();
+        match self {
+            Self::DirectoryCreation => {
+                ops.reserve(config.dirs_per_client);
+                for item in 0..config.dirs_per_client {
+                    ops.push(mkdir(&mdtest_dir_item(mode, rank, item))?);
+                }
             }
-            Ok::<_, anyhow::Error>(submitted)
+            Self::DirectoryStat => {
+                ops.reserve(config.dirs_per_client);
+                for item in 0..config.dirs_per_client {
+                    ops.push(stat(&mdtest_dir_item(mode, rank, item))?);
+                }
+            }
+            Self::DirectoryRemoval => {
+                ops.reserve(config.dirs_per_client);
+                for item in 0..config.dirs_per_client {
+                    ops.push(rmdir(&mdtest_dir_item(mode, rank, item))?);
+                }
+            }
+            Self::FileCreation => {
+                ops.reserve(config.files_per_client);
+                for item in 0..config.files_per_client {
+                    ops.push(create(&mdtest_file_item(mode, rank, item))?);
+                }
+            }
+            Self::FileStat => {
+                ops.reserve(config.files_per_client);
+                for item in 0..config.files_per_client {
+                    ops.push(stat(&mdtest_file_item(mode, rank, item))?);
+                }
+            }
+            Self::FileRemoval => {
+                ops.reserve(config.files_per_client);
+                for item in 0..config.files_per_client {
+                    ops.push(unlink(&mdtest_file_item(mode, rank, item))?);
+                }
+            }
+        }
+        Ok(ops)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SubmittedClientTx {
+    label: String,
+    expected: TxResult,
+    tx_id: u64,
+    result_shard: ShardId,
+}
+
+#[derive(Clone, Debug)]
+struct RankPhaseResult {
+    rank: usize,
+    items: usize,
+    time_before_barrier: Duration,
+    time: Duration,
+}
+
+#[derive(Clone, Debug)]
+struct PhaseSummary {
+    phase: MdtestPhase,
+    ranks: Vec<RankPhaseResult>,
+    aggregate_ops_per_sec: f64,
+    aggregate_ms_per_op: f64,
+}
+
+#[derive(Clone, Debug)]
+struct ModeSummary {
+    mode: MdtestMode,
+    phases: Vec<PhaseSummary>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FloatStats {
+    max: f64,
+    min: f64,
+    mean: f64,
+}
+
+async fn run_mdtest_mode(
+    mode: MdtestMode,
+    config: &MdtestConfig,
+    sequencer_endpoint: &str,
+    shard_endpoints: &BTreeMap<ShardId, String>,
+) -> Result<ModeSummary> {
+    let mut sequencer =
+        pb::sequencer_client::SequencerClient::connect(sequencer_endpoint.to_string()).await?;
+    setup_mdtest_mode(&mut sequencer, shard_endpoints, mode, config).await?;
+
+    let mut phases = Vec::new();
+    for phase in MdtestPhase::all() {
+        let ranks =
+            run_mdtest_phase(phase, mode, config, sequencer_endpoint, shard_endpoints).await?;
+        phases.push(PhaseSummary::new(phase, ranks));
+    }
+
+    cleanup_mdtest_mode(&mut sequencer, shard_endpoints, mode, config).await?;
+    Ok(ModeSummary { mode, phases })
+}
+
+async fn run_mdtest_phase(
+    phase: MdtestPhase,
+    mode: MdtestMode,
+    config: &MdtestConfig,
+    sequencer_endpoint: &str,
+    shard_endpoints: &BTreeMap<ShardId, String>,
+) -> Result<Vec<RankPhaseResult>> {
+    let start_barrier = Arc::new(tokio::sync::Barrier::new(config.client_count));
+    let end_barrier = Arc::new(tokio::sync::Barrier::new(config.client_count));
+    let mut handles = Vec::with_capacity(config.client_count);
+
+    for rank in 0..config.client_count {
+        let config = *config;
+        let sequencer_endpoint = sequencer_endpoint.to_string();
+        let shard_endpoints = shard_endpoints.clone();
+        let start_barrier = start_barrier.clone();
+        let end_barrier = end_barrier.clone();
+        handles.push(tokio::spawn(async move {
+            run_mdtest_rank_phase(
+                phase,
+                mode,
+                config,
+                rank,
+                sequencer_endpoint,
+                shard_endpoints,
+                start_barrier,
+                end_barrier,
+            )
+            .await
         }));
     }
 
-    let mut submitted = Vec::with_capacity(PARALLEL_CLIENT_COUNT * CREATES_PER_PARALLEL_CLIENT);
+    let mut results = Vec::with_capacity(config.client_count);
     for handle in handles {
-        submitted.extend(handle.await.expect("parallel client task panicked")?);
+        results.push(handle.await.expect("mdtest client task panicked")?);
     }
-    submitted.sort_by_key(|tx| tx.tx_id);
+    results.sort_by_key(|result| result.rank);
+    Ok(results)
+}
 
-    let expected_parallel_count = PARALLEL_CLIENT_COUNT * CREATES_PER_PARALLEL_CLIENT;
-    assert_eq!(submitted.len(), expected_parallel_count);
-    assert_eq!(expected_parallel_count % BATCH_SIZE, 0);
+async fn run_mdtest_rank_phase(
+    phase: MdtestPhase,
+    mode: MdtestMode,
+    config: MdtestConfig,
+    rank: usize,
+    sequencer_endpoint: String,
+    shard_endpoints: BTreeMap<ShardId, String>,
+    start_barrier: Arc<tokio::sync::Barrier>,
+    end_barrier: Arc<tokio::sync::Barrier>,
+) -> Result<RankPhaseResult> {
+    let ops = phase.operations_for_rank(mode, &config, rank)?;
+    let mut sequencer = pb::sequencer_client::SequencerClient::connect(sequencer_endpoint).await?;
+    let mut shard_clients = connect_shard_clients(&shard_endpoints).await?;
 
-    let first_parallel_tx = reference_batches
-        .last()
-        .and_then(|batch| batch.txs.last())
-        .map(|tx| tx.tx_id + 1)
-        .expect("setup batch contains transactions");
-    for (index, tx) in submitted.iter().enumerate() {
-        let expected_tx_id = first_parallel_tx + index as u64;
-        if tx.tx_id != expected_tx_id {
-            bail!(
-                "{} expected tx_id {}, got {}",
-                tx.label,
-                expected_tx_id,
-                tx.tx_id
-            );
-        }
-        let (read_set, write_set) = derive_read_write_set(&tx.op)?;
-        let expected_result_shard = layout
-            .result_shard_for_sets(&read_set, &write_set)
-            .expect("parallel create has a result shard");
-        if tx.result_shard != expected_result_shard {
-            bail!(
-                "{} expected result_shard {}, got {}",
-                tx.label,
-                expected_result_shard,
-                tx.result_shard
-            );
-        }
+    start_barrier.wait().await;
+    let started = Instant::now();
+
+    let mut submitted = Vec::with_capacity(ops.len());
+    for (op_index, op) in ops.into_iter().enumerate() {
+        let label = format!(
+            "mdtest:{}:{}:rank_{rank}:op_{op_index}",
+            mode.name(),
+            phase.name()
+        );
+        let response = sequencer
+            .submit_tx(pb::SubmitTxRequest {
+                op: Some(fs_op_to_proto(&op)),
+            })
+            .await?
+            .into_inner();
+        submitted.push(SubmittedClientTx {
+            label,
+            expected: TxResult::Ok,
+            tx_id: response.tx_id,
+            result_shard: response.result_shard,
+        });
     }
 
     for tx in &submitted {
-        let mut shard =
-            pb::shard_client::ShardClient::connect(shard_endpoints[&tx.result_shard].clone())
-                .await?;
+        let shard = shard_clients
+            .get_mut(&tx.result_shard)
+            .expect("result shard client should be connected");
         let result = shard
             .get_tx_result(pb::GetTxResultRequest { tx_id: tx.tx_id })
             .await?
@@ -426,49 +676,465 @@ async fn run_parallel_submit_tx_driver(
         assert_ready_result(&tx.label, &result, tx.expected)?;
     }
 
-    for (batch_index, chunk) in submitted.chunks(BATCH_SIZE).enumerate() {
-        let batch_id = 2 + batch_index as u64;
-        let tx_ids = chunk.iter().map(|tx| tx.tx_id).collect();
-        let ops = chunk.iter().map(|tx| tx.op.clone()).collect();
-        reference_batches.push(reference_batch(batch_id, tx_ids, ops)?);
-    }
+    let time_before_barrier = started.elapsed();
+    end_barrier.wait().await;
+    let time = started.elapsed();
 
-    submit_expected_batch(
-        &mut sequencer,
-        vec![expect(
-            "parallel_barrier:stat_root",
-            stat("/")?,
-            TxResult::Ok,
-        )],
-        &mut reference_batches,
-        &mut all_records,
+    Ok(RankPhaseResult {
+        rank,
+        items: submitted.len(),
+        time_before_barrier,
+        time,
+    })
+}
+
+async fn setup_mdtest_mode(
+    sequencer: &mut pb::sequencer_client::SequencerClient<tonic::transport::Channel>,
+    shard_endpoints: &BTreeMap<ShardId, String>,
+    mode: MdtestMode,
+    config: &MdtestConfig,
+) -> Result<()> {
+    submit_client_tx(
+        sequencer,
+        shard_endpoints,
+        &format!("mdtest:{}:setup:mkdir_root", mode.name()),
+        mkdir(mode.root())?,
+        TxResult::Ok,
     )
     .await?;
 
-    let mut shard_states = Vec::new();
-    for (shard_id, endpoint) in &shard_endpoints {
-        let mut client = pb::shard_client::ShardClient::connect(endpoint.clone()).await?;
-        let response = client
-            .dump_state(pb::DumpStateRequest {})
-            .await?
-            .into_inner();
-        shard_states.push((*shard_id, inode_entries_from_proto(response.entries)?));
+    match mode {
+        MdtestMode::Private => {
+            for rank in 0..config.client_count {
+                submit_client_tx(
+                    sequencer,
+                    shard_endpoints,
+                    &format!("mdtest:private:setup:mkdir_client_{rank}"),
+                    mkdir(&private_client_root(rank))?,
+                    TxResult::Ok,
+                )
+                .await?;
+                submit_client_tx(
+                    sequencer,
+                    shard_endpoints,
+                    &format!("mdtest:private:setup:mkdir_client_{rank}_dirs"),
+                    mkdir(&private_dir_parent(rank))?,
+                    TxResult::Ok,
+                )
+                .await?;
+                submit_client_tx(
+                    sequencer,
+                    shard_endpoints,
+                    &format!("mdtest:private:setup:mkdir_client_{rank}_files"),
+                    mkdir(&private_file_parent(rank))?,
+                    TxResult::Ok,
+                )
+                .await?;
+            }
+        }
+        MdtestMode::Public => {
+            submit_client_tx(
+                sequencer,
+                shard_endpoints,
+                "mdtest:public:setup:mkdir_dirs",
+                mkdir(&public_dir_parent())?,
+                TxResult::Ok,
+            )
+            .await?;
+            submit_client_tx(
+                sequencer,
+                shard_endpoints,
+                "mdtest:public:setup:mkdir_files",
+                mkdir(&public_file_parent())?,
+                TxResult::Ok,
+            )
+            .await?;
+        }
     }
-
-    let expected = reference_execute_batches(&reference_batches);
-    let actual = merge_shard_states(&layout, shard_states)?;
-    assert_state_matches(&expected, &actual)?;
 
     Ok(())
 }
 
-#[derive(Clone, Debug)]
-struct SubmittedClientTx {
-    label: String,
+async fn cleanup_mdtest_mode(
+    sequencer: &mut pb::sequencer_client::SequencerClient<tonic::transport::Channel>,
+    shard_endpoints: &BTreeMap<ShardId, String>,
+    mode: MdtestMode,
+    config: &MdtestConfig,
+) -> Result<()> {
+    match mode {
+        MdtestMode::Private => {
+            for rank in 0..config.client_count {
+                submit_client_tx(
+                    sequencer,
+                    shard_endpoints,
+                    &format!("mdtest:private:cleanup:rmdir_client_{rank}_files"),
+                    rmdir(&private_file_parent(rank))?,
+                    TxResult::Ok,
+                )
+                .await?;
+                submit_client_tx(
+                    sequencer,
+                    shard_endpoints,
+                    &format!("mdtest:private:cleanup:rmdir_client_{rank}_dirs"),
+                    rmdir(&private_dir_parent(rank))?,
+                    TxResult::Ok,
+                )
+                .await?;
+                submit_client_tx(
+                    sequencer,
+                    shard_endpoints,
+                    &format!("mdtest:private:cleanup:rmdir_client_{rank}"),
+                    rmdir(&private_client_root(rank))?,
+                    TxResult::Ok,
+                )
+                .await?;
+            }
+        }
+        MdtestMode::Public => {
+            submit_client_tx(
+                sequencer,
+                shard_endpoints,
+                "mdtest:public:cleanup:rmdir_files",
+                rmdir(&public_file_parent())?,
+                TxResult::Ok,
+            )
+            .await?;
+            submit_client_tx(
+                sequencer,
+                shard_endpoints,
+                "mdtest:public:cleanup:rmdir_dirs",
+                rmdir(&public_dir_parent())?,
+                TxResult::Ok,
+            )
+            .await?;
+        }
+    }
+
+    submit_client_tx(
+        sequencer,
+        shard_endpoints,
+        &format!("mdtest:{}:cleanup:rmdir_root", mode.name()),
+        rmdir(mode.root())?,
+        TxResult::Ok,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn submit_client_tx(
+    sequencer: &mut pb::sequencer_client::SequencerClient<tonic::transport::Channel>,
+    shard_endpoints: &BTreeMap<ShardId, String>,
+    label: &str,
     op: FsOp,
     expected: TxResult,
-    tx_id: u64,
-    result_shard: ShardId,
+) -> Result<SubmittedClientTx> {
+    let response = sequencer
+        .submit_tx(pb::SubmitTxRequest {
+            op: Some(fs_op_to_proto(&op)),
+        })
+        .await?
+        .into_inner();
+    let mut shard =
+        pb::shard_client::ShardClient::connect(shard_endpoints[&response.result_shard].clone())
+            .await?;
+    let result = shard
+        .get_tx_result(pb::GetTxResultRequest {
+            tx_id: response.tx_id,
+        })
+        .await?
+        .into_inner();
+    assert_ready_result(label, &result, expected)?;
+    Ok(SubmittedClientTx {
+        label: label.to_string(),
+        expected,
+        tx_id: response.tx_id,
+        result_shard: response.result_shard,
+    })
+}
+
+async fn connect_shard_clients(
+    shard_endpoints: &BTreeMap<ShardId, String>,
+) -> Result<BTreeMap<ShardId, pb::shard_client::ShardClient<tonic::transport::Channel>>> {
+    let mut clients = BTreeMap::new();
+    for (shard_id, endpoint) in shard_endpoints {
+        clients.insert(
+            *shard_id,
+            pb::shard_client::ShardClient::connect(endpoint.clone()).await?,
+        );
+    }
+    Ok(clients)
+}
+
+impl PhaseSummary {
+    fn new(phase: MdtestPhase, ranks: Vec<RankPhaseResult>) -> Self {
+        let total_items: usize = ranks.iter().map(|rank| rank.items).sum();
+        let max_time = ranks
+            .iter()
+            .map(|rank| rank.time.as_secs_f64())
+            .fold(0.0, f64::max);
+        let aggregate_ops_per_sec = if total_items == 0 || max_time == 0.0 {
+            0.0
+        } else {
+            total_items as f64 / max_time
+        };
+        let aggregate_ms_per_op = if aggregate_ops_per_sec == 0.0 {
+            0.0
+        } else {
+            1000.0 / aggregate_ops_per_sec
+        };
+        Self {
+            phase,
+            ranks,
+            aggregate_ops_per_sec,
+            aggregate_ms_per_op,
+        }
+    }
+
+    fn rank_rate_stats(&self) -> FloatStats {
+        float_stats(
+            self.ranks
+                .iter()
+                .map(|rank| ops_per_sec(rank.items, rank.time_before_barrier)),
+        )
+    }
+
+    fn rank_time_stats(&self) -> FloatStats {
+        float_stats(
+            self.ranks
+                .iter()
+                .map(|rank| ms_per_op(rank.items, rank.time_before_barrier)),
+        )
+    }
+}
+
+fn print_mode_summary(summary: &ModeSummary, show_ranks: bool) {
+    println!(
+        "\n{} mode SUMMARY rate (in ops/sec):",
+        summary.mode.name().to_uppercase()
+    );
+    println!(
+        "{:<22} {:>14} {:>14} {:>14}    {:>14} {:>14} {:>14} {:>14}",
+        "Operation",
+        "Rank Max",
+        "Rank Min",
+        "Rank Mean",
+        "Iter Max",
+        "Iter Min",
+        "Iter Mean",
+        "Std Dev"
+    );
+    for phase in &summary.phases {
+        let stats = phase.rank_rate_stats();
+        print_summary_row(
+            phase.phase.name(),
+            stats,
+            phase.aggregate_ops_per_sec,
+            phase.aggregate_ops_per_sec,
+            phase.aggregate_ops_per_sec,
+            0.0,
+        );
+    }
+
+    println!(
+        "\n{} mode SUMMARY time (in ms/op):",
+        summary.mode.name().to_uppercase()
+    );
+    println!(
+        "{:<22} {:>14} {:>14} {:>14}    {:>14} {:>14} {:>14} {:>14}",
+        "Operation",
+        "Rank Max",
+        "Rank Min",
+        "Rank Mean",
+        "Iter Max",
+        "Iter Min",
+        "Iter Mean",
+        "Std Dev"
+    );
+    for phase in &summary.phases {
+        let stats = phase.rank_time_stats();
+        print_summary_row(
+            phase.phase.name(),
+            stats,
+            phase.aggregate_ms_per_op,
+            phase.aggregate_ms_per_op,
+            phase.aggregate_ms_per_op,
+            0.0,
+        );
+    }
+
+    if show_ranks {
+        println!(
+            "\n{} mode per-rank details:",
+            summary.mode.name().to_uppercase()
+        );
+        println!(
+            "{:<22} {:>6} {:>8} {:>14} {:>14} {:>14}",
+            "Operation", "Rank", "Items", "Ops/sec", "ms/op", "Elapsed ms"
+        );
+        for phase in &summary.phases {
+            for rank in &phase.ranks {
+                println!(
+                    "{:<22} {:>6} {:>8} {:>14.3} {:>14.6} {:>14.3}",
+                    phase.phase.name(),
+                    rank.rank,
+                    rank.items,
+                    ops_per_sec(rank.items, rank.time_before_barrier),
+                    ms_per_op(rank.items, rank.time_before_barrier),
+                    rank.time_before_barrier.as_secs_f64() * 1000.0
+                );
+            }
+        }
+    }
+}
+
+fn print_summary_row(
+    operation: &str,
+    rank_stats: FloatStats,
+    iter_max: f64,
+    iter_min: f64,
+    iter_mean: f64,
+    std_dev: f64,
+) {
+    println!(
+        "{:<22} {:>14.3} {:>14.3} {:>14.3}    {:>14.3} {:>14.3} {:>14.3} {:>14.3}",
+        operation,
+        rank_stats.max,
+        rank_stats.min,
+        rank_stats.mean,
+        iter_max,
+        iter_min,
+        iter_mean,
+        std_dev
+    );
+}
+
+fn print_comparison_summary(private_summary: &ModeSummary, public_summary: &ModeSummary) {
+    println!("\nPrivate/Public comparison:");
+    println!(
+        "{:<22} {:>16} {:>16} {:>16}",
+        "Operation", "Private ops/s", "Public ops/s", "Public/Private"
+    );
+    for private_phase in &private_summary.phases {
+        let public_phase = public_summary
+            .phases
+            .iter()
+            .find(|phase| phase.phase == private_phase.phase)
+            .expect("public summary should contain same phase");
+        let ratio = if private_phase.aggregate_ops_per_sec == 0.0 {
+            0.0
+        } else {
+            public_phase.aggregate_ops_per_sec / private_phase.aggregate_ops_per_sec
+        };
+        println!(
+            "{:<22} {:>16.3} {:>16.3} {:>16.3}",
+            private_phase.phase.name(),
+            private_phase.aggregate_ops_per_sec,
+            public_phase.aggregate_ops_per_sec,
+            ratio
+        );
+    }
+}
+
+fn read_positive_usize_env(name: &str, default: usize) -> Result<usize> {
+    let Some(value) = env::var_os(name) else {
+        return Ok(default);
+    };
+    let value = value.to_string_lossy();
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|err| anyhow::anyhow!("{name} must be a positive integer: {err}"))?;
+    if parsed == 0 {
+        bail!("{name} must be greater than zero");
+    }
+    Ok(parsed)
+}
+
+fn read_bool_env(name: &str, default: bool) -> Result<bool> {
+    let Some(value) = env::var_os(name) else {
+        return Ok(default);
+    };
+    match value.to_string_lossy().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        other => bail!("{name} must be one of 1/0/true/false/yes/no/on/off, got {other}"),
+    }
+}
+
+fn float_stats(values: impl IntoIterator<Item = f64>) -> FloatStats {
+    let mut count = 0usize;
+    let mut sum = 0.0;
+    let mut max = f64::NEG_INFINITY;
+    let mut min = f64::INFINITY;
+    for value in values {
+        count += 1;
+        sum += value;
+        max = max.max(value);
+        min = min.min(value);
+    }
+    if count == 0 {
+        return FloatStats {
+            max: 0.0,
+            min: 0.0,
+            mean: 0.0,
+        };
+    }
+    FloatStats {
+        max,
+        min,
+        mean: sum / count as f64,
+    }
+}
+
+fn ops_per_sec(items: usize, duration: Duration) -> f64 {
+    let seconds = duration.as_secs_f64();
+    if items == 0 || seconds == 0.0 {
+        0.0
+    } else {
+        items as f64 / seconds
+    }
+}
+
+fn ms_per_op(items: usize, duration: Duration) -> f64 {
+    let seconds = duration.as_secs_f64();
+    if items == 0 {
+        0.0
+    } else {
+        seconds * 1000.0 / items as f64
+    }
+}
+
+fn private_client_root(rank: usize) -> String {
+    format!("{MDTEST_PRIVATE_ROOT}/client_{rank}")
+}
+
+fn private_dir_parent(rank: usize) -> String {
+    format!("{}/dirs", private_client_root(rank))
+}
+
+fn private_file_parent(rank: usize) -> String {
+    format!("{}/files", private_client_root(rank))
+}
+
+fn public_dir_parent() -> String {
+    format!("{MDTEST_PUBLIC_ROOT}/dirs")
+}
+
+fn public_file_parent() -> String {
+    format!("{MDTEST_PUBLIC_ROOT}/files")
+}
+
+fn mdtest_dir_item(mode: MdtestMode, rank: usize, item: usize) -> String {
+    match mode {
+        MdtestMode::Private => format!("{}/dir_{item}", private_dir_parent(rank)),
+        MdtestMode::Public => format!("{}/dir_c{rank}_{item}", public_dir_parent()),
+    }
+}
+
+fn mdtest_file_item(mode: MdtestMode, rank: usize, item: usize) -> String {
+    match mode {
+        MdtestMode::Private => format!("{}/file_{item}", private_file_parent(rank)),
+        MdtestMode::Public => format!("{}/file_c{rank}_{item}", public_file_parent()),
+    }
 }
 
 fn assert_ready_result(
@@ -910,9 +1576,18 @@ fn stat(path: &str) -> Result<FsOp> {
 }
 
 fn start_shard_node(shard_id: ShardId, ip: IpAddr, peer_endpoints: BTreeMap<ShardId, String>) {
+    start_shard_node_with_name(format!("shard-{shard_id}"), shard_id, ip, peer_endpoints);
+}
+
+fn start_shard_node_with_name(
+    node_name: String,
+    shard_id: ShardId,
+    ip: IpAddr,
+    peer_endpoints: BTreeMap<ShardId, String>,
+) {
     let node = madsim::runtime::Handle::current()
         .create_node()
-        .name(format!("shard-{shard_id}"))
+        .name(node_name)
         .ip(ip)
         .build();
     node.spawn(async move {
@@ -947,9 +1622,34 @@ fn start_sequencer_node_with_flush_interval(
     shard_endpoints: BTreeMap<ShardId, String>,
     batch_flush_interval: Duration,
 ) {
+    start_sequencer_node_with_config(ip, shard_endpoints, BATCH_SIZE, batch_flush_interval);
+}
+
+fn start_sequencer_node_with_config(
+    ip: IpAddr,
+    shard_endpoints: BTreeMap<ShardId, String>,
+    max_batch_size: usize,
+    batch_flush_interval: Duration,
+) {
+    start_sequencer_node_with_config_and_name(
+        "sequencer".to_string(),
+        ip,
+        shard_endpoints,
+        max_batch_size,
+        batch_flush_interval,
+    );
+}
+
+fn start_sequencer_node_with_config_and_name(
+    node_name: String,
+    ip: IpAddr,
+    shard_endpoints: BTreeMap<ShardId, String>,
+    max_batch_size: usize,
+    batch_flush_interval: Duration,
+) {
     let node = madsim::runtime::Handle::current()
         .create_node()
-        .name("sequencer")
+        .name(node_name)
         .ip(ip)
         .build();
     node.spawn(async move {
@@ -957,7 +1657,7 @@ fn start_sequencer_node_with_flush_interval(
             node_id: "sequencer".to_string(),
             shard_count: SHARD_COUNT,
             shard_endpoints,
-            max_batch_size: BATCH_SIZE,
+            max_batch_size,
             batch_flush_interval,
         }));
         let addr = SocketAddr::new(ip, SEQUENCER_PORT);
@@ -1029,6 +1729,14 @@ fn reference_batch(batch_id: u64, tx_ids: Vec<u64>, ops: Vec<FsOp>) -> Result<Ba
 
 fn shard_ip(shard_id: ShardId) -> IpAddr {
     IpAddr::V4(Ipv4Addr::new(10, 0, 0, shard_id as u8 + 1))
+}
+
+fn mdtest_shard_ip(network: u8, shard_id: ShardId) -> IpAddr {
+    mdtest_node_ip(network, shard_id as u8 + 1)
+}
+
+fn mdtest_node_ip(network: u8, host: u8) -> IpAddr {
+    IpAddr::V4(Ipv4Addr::new(10, network, 0, host))
 }
 
 fn endpoint(ip: IpAddr, port: u16) -> String {

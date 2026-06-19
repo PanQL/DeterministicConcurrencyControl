@@ -1221,15 +1221,36 @@ all_shards_dump -> sharded_final_state
 - read-only `Stat` 的 `result_shard` 等于 deterministic read-only coordinator。
 - madsim client API test 通过，并且 final state 与 serial reference execution 一致。
 
-### Milestone 3：engine workload and validation
+### Milestone 3：mdtest-like client performance workload
 
 范围：
 
-- 面向 engine 的随机 metadata operation workload。
-- 多 simulated client nodes。
-- 多 batch 顺序执行和结果查询。
-- checker 覆盖更多路径和错误语义。
-- latency/throughput/trace summary 仅作为模拟测试输出。
+- 参考 mdtest 的 phase/barrier/result-summary 模型，实现 client-facing 性能测试。
+- 支持 private mode：每个 client/rank 在自己的 private working directory 下操作。
+- 支持 public mode：所有 client/rank 在共享 parent directory 下操作不同名字的条目。
+- private 和 public 必须分别从 fresh madsim cluster 启动，避免 result registry 或内部 map 历史状态影响对比。
+- 每个 client coroutine 对应一个 mdtest rank，并自行调用 `SubmitTx` 和 blocking `GetTxResult`。
+- 输出 private/public 两种模式的 mdtest-style rate 和 time summary。
+- 输出 public/private ops/sec 对比表。
+- 默认测试规模较小并进入 `cargo test`；通过环境变量放大规模做专门性能测试。
+
+默认配置：
+
+- `CALVINFS_MDTEST_CLIENTS=8`
+- `CALVINFS_MDTEST_DIRS_PER_CLIENT=4`
+- `CALVINFS_MDTEST_FILES_PER_CLIENT=64`
+- `CALVINFS_MDTEST_BATCH_SIZE=512`
+- `CALVINFS_MDTEST_SHOW_RANKS=0`
+
+完成标准：
+
+- `mdtest_like_client_workload` 在 madsim 中通过。
+- timed phases 覆盖 Directory creation/stat/removal 和 File creation/stat/removal。
+- 每条 timed operation 的 `GetTxResult` 返回 `READY/Ok`。
+- 输出 private summary、public summary 和 private/public comparison。
+- cleanup 后 private/public test roots 均不存在，root 仍可 `Stat`。
+
+该 milestone 是性能测试，不承担完整功能语义验证。失败路径、`Rename` 和 serial reference checker 继续由功能集成测试覆盖。
 
 ## 10. 收敛状态
 
