@@ -1,5 +1,6 @@
 use crate::convert::{
     batch_to_proto, local_read_status_to_i32, read_entries_to_proto, read_phase_to_i32,
+    tx_result_to_i32, write_entries_to_proto,
 };
 use crate::error::{Error, Result};
 use crate::executor::{
@@ -23,7 +24,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, oneshot, watch, Mutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex, Notify};
 
 const BATCH_QUEUE_CAPACITY: usize = 16;
 const DEFAULT_MAILBOX_CAPACITY: usize = 1024;
@@ -47,6 +48,7 @@ pub enum SchedulerKind {
     #[default]
     CalvinLocking,
     SccOnline,
+    Aria,
 }
 
 #[derive(Clone, Debug)]
@@ -71,6 +73,7 @@ struct ShardCore {
     store: Arc<RedbInMemoryInodeStore>,
     peer_endpoints: Arc<BTreeMap<ShardId, String>>,
     mailboxes: ReadResultMailboxRegistry,
+    aria_batches: AriaBatchRegistry,
     client_results: TxResultRegistry,
     scc_reorders: Arc<Mutex<BTreeMap<BatchId, SccReorderRecord>>>,
     scheduler_profiles: Arc<Mutex<BTreeMap<(BatchId, ShardId), SchedulerProfileRecord>>>,
@@ -87,6 +90,45 @@ pub struct BatchExecutionSummary {
 struct ProfiledBatchExecution {
     summary: BatchExecutionSummary,
     profile: Option<SchedulerProfileRecord>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AriaStageOutcome {
+    pub batch_id: BatchId,
+    pub tx_index: usize,
+    pub tx_id: TxId,
+    pub from_shard: ShardId,
+    pub result: TxResult,
+    pub writes: Vec<crate::model::WriteOp>,
+    pub is_result_shard: bool,
+}
+
+#[derive(Clone, Debug)]
+struct AriaStagedOutcome {
+    tx_index: usize,
+    tx_id: TxId,
+    result: Option<TxResult>,
+    local_writes: Vec<crate::model::WriteOp>,
+    is_result_shard: bool,
+}
+
+#[derive(Default)]
+struct AriaBatchState {
+    staged_outcomes: BTreeMap<usize, AriaStagedOutcome>,
+    readers_by_key: BTreeMap<Key, BTreeSet<usize>>,
+    writers_by_key: BTreeMap<Key, BTreeSet<usize>>,
+    execution_done_reports: BTreeSet<ShardId>,
+    failure_reports: BTreeMap<ShardId, BTreeSet<usize>>,
+}
+
+struct AriaBatchEntry {
+    state: Mutex<AriaBatchState>,
+    notify: Notify,
+}
+
+#[derive(Clone, Default)]
+struct AriaBatchRegistry {
+    inner: Arc<Mutex<BTreeMap<BatchId, Arc<AriaBatchEntry>>>>,
 }
 
 #[derive(Default)]
@@ -136,6 +178,7 @@ impl ShardRuntime {
             store: Arc::new(RedbInMemoryInodeStore::new()?),
             peer_endpoints: Arc::new(config.peer_endpoints),
             mailboxes: ReadResultMailboxRegistry::new(),
+            aria_batches: AriaBatchRegistry::new(),
             client_results: TxResultRegistry::new(),
             scc_reorders: Arc::new(Mutex::new(BTreeMap::new())),
             scheduler_profiles: Arc::new(Mutex::new(BTreeMap::new())),
@@ -167,6 +210,62 @@ impl ShardRuntime {
 
     pub async fn route_local_read_result(&self, result: LocalReadResult) -> Result<()> {
         self.core.mailboxes.route(result).await
+    }
+
+    pub async fn aria_read_snapshot(
+        &self,
+        batch_id: BatchId,
+        tx_index: usize,
+        tx_id: TxId,
+        from_shard: ShardId,
+        key: Key,
+    ) -> Result<ReadValue> {
+        self.core
+            .aria_batches
+            .read_snapshot(
+                self.core.clone(),
+                batch_id,
+                tx_index,
+                tx_id,
+                from_shard,
+                key,
+            )
+            .await
+    }
+
+    pub async fn route_aria_stage_outcome(&self, outcome: AriaStageOutcome) -> Result<()> {
+        self.core
+            .aria_batches
+            .stage_outcome(self.core.clone(), outcome)
+            .await
+    }
+
+    pub async fn report_aria_execution_done(
+        &self,
+        batch_id: BatchId,
+        from_shard: ShardId,
+    ) -> Result<()> {
+        self.core
+            .aria_batches
+            .record_execution_done(batch_id, from_shard, self.core.layout.shard_count)
+            .await
+    }
+
+    pub async fn report_aria_local_failures(
+        &self,
+        batch_id: BatchId,
+        from_shard: ShardId,
+        failed_indices: BTreeSet<usize>,
+    ) -> Result<()> {
+        self.core
+            .aria_batches
+            .record_local_failures(
+                batch_id,
+                from_shard,
+                failed_indices,
+                self.core.layout.shard_count,
+            )
+            .await
     }
 
     pub async fn get_tx_result(&self, tx_id: TxId) -> Result<ClientTxResult> {
@@ -223,9 +322,13 @@ async fn execute_batch_on_shard(
         SchedulerKind::SccOnline => {
             execute_scc_batch(core.clone(), batch.clone(), core.scheduler_profile_enabled).await
         }
+        SchedulerKind::Aria => {
+            execute_aria_batch(core.clone(), batch.clone(), core.scheduler_profile_enabled).await
+        }
     };
     let cleanup_started = Instant::now();
     core.mailboxes.cleanup_batch(batch.batch_id).await;
+    core.aria_batches.cleanup_batch(batch.batch_id).await;
     let cleanup_ns = elapsed_ns(cleanup_started);
 
     if let Ok(profiled) = &mut result {
@@ -650,6 +753,243 @@ async fn execute_scc_batch(
     })
 }
 
+async fn execute_aria_batch(
+    core: Arc<ShardCore>,
+    batch: Batch,
+    profile_enabled: bool,
+) -> Result<ProfiledBatchExecution> {
+    let mut profile = profile_enabled
+        .then(|| new_scheduler_profile(SchedulerProfileScheduler::Aria, &batch, &core));
+
+    let validate_started = Instant::now();
+    validate_batch_order(&batch)?;
+    add_timing(&mut profile, |timings| {
+        timings.validate_ns = timings
+            .validate_ns
+            .saturating_add(elapsed_ns(validate_started));
+    });
+
+    for tx in &batch.txs {
+        let result_shard = aria_result_shard(tx.tx_id, core.layout.shard_count);
+        let registry_started = Instant::now();
+        if result_shard == core.shard_id {
+            core.client_results.ensure_pending(tx.tx_id).await;
+        } else {
+            core.client_results.mark_not_responsible(tx.tx_id).await;
+        }
+        add_timing(&mut profile, |timings| {
+            timings.result_registry_ns = timings
+                .result_registry_ns
+                .saturating_add(elapsed_ns(registry_started));
+        });
+    }
+
+    let (worker_tx, mut worker_rx) = mpsc::channel(batch.txs.len().max(1));
+    let mut coordinator_count = 0usize;
+    for (tx_index, tx) in batch.txs.iter().enumerate() {
+        let result_shard = aria_result_shard(tx.tx_id, core.layout.shard_count);
+        if result_shard != core.shard_id {
+            continue;
+        }
+        coordinator_count += 1;
+        add_counter(&mut profile, |counters| {
+            counters.relevant_tx_count = counters.relevant_tx_count.saturating_add(1);
+            counters.active_tx_count = counters.active_tx_count.saturating_add(1);
+        });
+        let worker_tx = worker_tx.clone();
+        let core = core.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let result = run_aria_coordinator(core, batch.batch_id, tx_index, tx).await;
+            let _ = worker_tx.send(result).await;
+        });
+    }
+    drop(worker_tx);
+
+    for _ in 0..coordinator_count {
+        let result = worker_rx.recv().await.ok_or_else(|| {
+            Error::ChannelClosed(
+                "Aria coordinator channel closed before batch finished".to_string(),
+            )
+        })?;
+        result?;
+    }
+
+    let publish_started = Instant::now();
+    broadcast_aria_execution_done(core.clone(), batch.batch_id).await?;
+    add_timing(&mut profile, |timings| {
+        timings.completion_publish_ns = timings
+            .completion_publish_ns
+            .saturating_add(elapsed_ns(publish_started));
+    });
+    add_counter(&mut profile, |counters| {
+        counters.completion_reports_sent = counters.completion_reports_sent.saturating_add(1);
+    });
+
+    let collect_started = Instant::now();
+    core.aria_batches
+        .wait_execution_done(batch.batch_id, core.layout.shard_count as usize)
+        .await?;
+    add_timing(&mut profile, |timings| {
+        timings.completion_collect_ns = timings
+            .completion_collect_ns
+            .saturating_add(elapsed_ns(collect_started));
+    });
+    add_counter(&mut profile, |counters| {
+        counters.completion_reports_received = core.layout.shard_count;
+    });
+
+    let local_failed_indices = core.aria_batches.local_failed_indices(batch.batch_id).await;
+    if let Some(profile) = &mut profile {
+        profile.counters.local_failed_count = usize_to_u64(local_failed_indices.len());
+    }
+    let publish_started = Instant::now();
+    broadcast_aria_local_failures(core.clone(), batch.batch_id, &local_failed_indices).await?;
+    add_timing(&mut profile, |timings| {
+        timings.completion_publish_ns = timings
+            .completion_publish_ns
+            .saturating_add(elapsed_ns(publish_started));
+    });
+
+    let collect_started = Instant::now();
+    let global_failed_indices = core
+        .aria_batches
+        .wait_failure_reports(batch.batch_id, core.layout.shard_count as usize)
+        .await?;
+    add_timing(&mut profile, |timings| {
+        timings.completion_collect_ns = timings
+            .completion_collect_ns
+            .saturating_add(elapsed_ns(collect_started));
+    });
+    if let Some(profile) = &mut profile {
+        profile.counters.global_failed_count = usize_to_u64(global_failed_indices.len());
+    }
+
+    let record_started = Instant::now();
+    record_batch_reorder(
+        core.clone(),
+        batch.batch_id,
+        batch.txs.len(),
+        &global_failed_indices,
+    )
+    .await?;
+    add_timing(&mut profile, |timings| {
+        timings.record_reorder_ns = elapsed_ns(record_started);
+    });
+
+    let install_started = Instant::now();
+    let mut tx_results =
+        install_aria_successes(core.clone(), batch.batch_id, &global_failed_indices).await?;
+    add_timing(&mut profile, |timings| {
+        timings.install_successes_ns = elapsed_ns(install_started);
+    });
+
+    if !global_failed_indices.is_empty() {
+        let fallback_batch =
+            fallback_batch_from_failed_indices_with_derived_sets(&batch, &global_failed_indices)?;
+        add_counter(&mut profile, |counters| {
+            counters.fallback_tx_count = usize_to_u64(fallback_batch.txs.len());
+        });
+        let fallback_started = Instant::now();
+        let fallback_execution =
+            execute_aria_fallback_batch(core.clone(), fallback_batch, profile_enabled).await?;
+        add_timing(&mut profile, |timings| {
+            timings.fallback_ns = elapsed_ns(fallback_started);
+        });
+        tx_results.extend(fallback_execution.summary.tx_results);
+    }
+
+    tx_results.sort_by_key(|record| (record.tx_id, record.shard_id));
+    if let Some(profile) = &mut profile {
+        profile.counters.speculative_success_count =
+            usize_to_u64(batch.txs.len().saturating_sub(global_failed_indices.len()));
+        profile.counters.result_records_produced = usize_to_u64(tx_results.len());
+    }
+
+    Ok(ProfiledBatchExecution {
+        summary: BatchExecutionSummary {
+            batch_id: batch.batch_id,
+            shard_id: core.shard_id,
+            tx_results,
+        },
+        profile,
+    })
+}
+
+async fn run_aria_coordinator(
+    core: Arc<ShardCore>,
+    batch_id: BatchId,
+    tx_index: usize,
+    tx: OrderedTx,
+) -> Result<()> {
+    let read_keys = aria_read_keys_for_tx(&tx)?;
+    let mut full_reads = BTreeMap::new();
+    for key in read_keys {
+        let owner = core.layout.shard_for_key(&key);
+        let value = if owner == core.shard_id {
+            core.aria_batches
+                .read_snapshot(
+                    core.clone(),
+                    batch_id,
+                    tx_index,
+                    tx.tx_id,
+                    core.shard_id,
+                    key.clone(),
+                )
+                .await?
+        } else {
+            aria_read_snapshot_remote(
+                core.clone(),
+                batch_id,
+                tx_index,
+                tx.tx_id,
+                owner,
+                key.clone(),
+            )
+            .await?
+        };
+        if full_reads.insert(key.clone(), value).is_some() {
+            return Err(Error::InvalidBatch(format!(
+                "duplicate Aria full read key {} for tx {}",
+                key, tx.tx_id
+            )));
+        }
+    }
+
+    let output = execute_deterministic(&tx, &full_reads);
+    let result = output.result;
+    let result_shard = aria_result_shard(tx.tx_id, core.layout.shard_count);
+    let mut writes_by_shard: BTreeMap<ShardId, Vec<crate::model::WriteOp>> = BTreeMap::new();
+    for write in output.writes {
+        let owner = core.layout.shard_for_key(write.key());
+        writes_by_shard.entry(owner).or_default().push(write);
+    }
+    let mut targets: BTreeSet<ShardId> = writes_by_shard.keys().copied().collect();
+    targets.insert(result_shard);
+
+    for target in targets {
+        let writes = writes_by_shard.remove(&target).unwrap_or_default();
+        let outcome = AriaStageOutcome {
+            batch_id,
+            tx_index,
+            tx_id: tx.tx_id,
+            from_shard: core.shard_id,
+            result,
+            writes,
+            is_result_shard: target == result_shard,
+        };
+        if target == core.shard_id {
+            core.aria_batches
+                .stage_outcome(core.clone(), outcome)
+                .await?;
+        } else {
+            send_aria_stage_outcome(core.clone(), target, outcome).await?;
+        }
+    }
+
+    Ok(())
+}
+
 fn validate_batch_order(batch: &Batch) -> Result<()> {
     let mut seen = BTreeSet::new();
     for (index, tx) in batch.txs.iter().enumerate() {
@@ -667,6 +1007,521 @@ fn validate_batch_order(batch: &Batch) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn aria_result_shard(tx_id: TxId, shard_count: ShardId) -> ShardId {
+    tx_id % shard_count
+}
+
+fn aria_read_keys_for_tx(tx: &OrderedTx) -> Result<BTreeSet<Key>> {
+    derive_read_write_set(&tx.op).map(|(read_set, _)| read_set)
+}
+
+fn tx_with_derived_sets(tx: &OrderedTx) -> Result<OrderedTx> {
+    let (read_set, write_set) = derive_read_write_set(&tx.op)?;
+    let mut tx = tx.clone();
+    tx.read_set = read_set;
+    tx.write_set = write_set;
+    Ok(tx)
+}
+
+async fn aria_read_snapshot_remote(
+    core: Arc<ShardCore>,
+    batch_id: BatchId,
+    tx_index: usize,
+    tx_id: TxId,
+    target: ShardId,
+    key: Key,
+) -> Result<ReadValue> {
+    let endpoint = core
+        .peer_endpoints
+        .get(&target)
+        .ok_or(Error::MissingPeer(target))?
+        .clone();
+    let mut client = pb::shard_client::ShardClient::connect(endpoint).await?;
+    let response = client
+        .aria_read_snapshot(pb::AriaReadSnapshotRequest {
+            batch_id,
+            tx_index: tx_index as u32,
+            tx_id,
+            from_shard: core.shard_id,
+            key: String::from(&key),
+        })
+        .await?
+        .into_inner();
+    let (returned_key, value) = crate::convert::read_entry_from_proto(response.read)?;
+    if returned_key != key {
+        return Err(Error::InvalidBatch(format!(
+            "Aria read for tx {} requested key {}, got {}",
+            tx_id, key, returned_key
+        )));
+    }
+    Ok(value)
+}
+
+async fn send_aria_stage_outcome(
+    core: Arc<ShardCore>,
+    target: ShardId,
+    outcome: AriaStageOutcome,
+) -> Result<()> {
+    let endpoint = core
+        .peer_endpoints
+        .get(&target)
+        .ok_or(Error::MissingPeer(target))?
+        .clone();
+    let mut client = pb::shard_client::ShardClient::connect(endpoint).await?;
+    client
+        .aria_stage_outcome(pb::AriaStageOutcomeRequest {
+            batch_id: outcome.batch_id,
+            tx_index: outcome.tx_index as u32,
+            tx_id: outcome.tx_id,
+            from_shard: outcome.from_shard,
+            result: tx_result_to_i32(outcome.result),
+            writes: write_entries_to_proto(&outcome.writes),
+            is_result_shard: outcome.is_result_shard,
+        })
+        .await?;
+    Ok(())
+}
+
+async fn broadcast_aria_execution_done(core: Arc<ShardCore>, batch_id: BatchId) -> Result<()> {
+    for target in 0..core.layout.shard_count {
+        if target == core.shard_id {
+            core.aria_batches
+                .record_execution_done(batch_id, core.shard_id, core.layout.shard_count)
+                .await?;
+            continue;
+        }
+        let endpoint = core
+            .peer_endpoints
+            .get(&target)
+            .ok_or(Error::MissingPeer(target))?
+            .clone();
+        let mut client = pb::shard_client::ShardClient::connect(endpoint).await?;
+        client
+            .report_aria_execution_done(pb::AriaExecutionDoneRequest {
+                batch_id,
+                from_shard: core.shard_id,
+            })
+            .await?;
+    }
+    Ok(())
+}
+
+async fn broadcast_aria_local_failures(
+    core: Arc<ShardCore>,
+    batch_id: BatchId,
+    failed_indices: &BTreeSet<usize>,
+) -> Result<()> {
+    let failed_indices: Vec<u32> = failed_indices.iter().map(|index| *index as u32).collect();
+    for target in 0..core.layout.shard_count {
+        if target == core.shard_id {
+            core.aria_batches
+                .record_local_failures(
+                    batch_id,
+                    core.shard_id,
+                    failed_indices.iter().map(|index| *index as usize).collect(),
+                    core.layout.shard_count,
+                )
+                .await?;
+            continue;
+        }
+        let endpoint = core
+            .peer_endpoints
+            .get(&target)
+            .ok_or(Error::MissingPeer(target))?
+            .clone();
+        let mut client = pb::shard_client::ShardClient::connect(endpoint).await?;
+        client
+            .report_aria_local_failures(pb::AriaLocalFailuresRequest {
+                batch_id,
+                from_shard: core.shard_id,
+                failed_indices: failed_indices.clone(),
+            })
+            .await?;
+    }
+    Ok(())
+}
+
+async fn install_aria_successes(
+    core: Arc<ShardCore>,
+    batch_id: BatchId,
+    failed_indices: &BTreeSet<usize>,
+) -> Result<Vec<TxResultRecord>> {
+    let mut outcomes = core.aria_batches.staged_outcomes(batch_id).await;
+    outcomes.sort_by_key(|outcome| outcome.tx_index);
+    let mut records = Vec::new();
+    for outcome in outcomes {
+        if failed_indices.contains(&outcome.tx_index) {
+            continue;
+        }
+        core.store.apply_writes_atomically(&outcome.local_writes)?;
+        if outcome.is_result_shard {
+            let result = outcome.result.ok_or_else(|| {
+                Error::InvalidBatch(format!(
+                    "Aria result shard outcome for tx {} has no result",
+                    outcome.tx_id
+                ))
+            })?;
+            core.client_results.mark_ready(outcome.tx_id, result).await;
+            records.push(TxResultRecord {
+                tx_id: outcome.tx_id,
+                shard_id: core.shard_id,
+                result,
+            });
+        }
+    }
+    Ok(records)
+}
+
+async fn execute_aria_fallback_batch(
+    core: Arc<ShardCore>,
+    batch: Batch,
+    _profile_enabled: bool,
+) -> Result<ProfiledBatchExecution> {
+    validate_batch_order(&batch)?;
+    let mut lock_table = LockTable::new();
+    let (outcome_tx, mut outcome_rx) = mpsc::channel(batch.txs.len().max(1));
+    let mut relevant_count = 0usize;
+
+    for tx in &batch.txs {
+        let tx = tx_with_derived_sets(tx)?;
+        let local_lock_keys = core.layout.local_lock_keys(&tx, core.shard_id);
+        let local_read_keys = core.layout.local_read_keys(&tx, core.shard_id);
+        let local_write_keys = core.layout.local_write_keys(&tx, core.shard_id);
+        let result_shard = aria_result_shard(tx.tx_id, core.layout.shard_count);
+        let active = aria_fallback_active_shards(&core.layout, &tx);
+        let read_sources = owner_shards_for_keys(&core.layout, &tx.read_set);
+
+        if local_lock_keys.is_empty()
+            && !active.contains(&core.shard_id)
+            && !read_sources.contains(&core.shard_id)
+        {
+            continue;
+        }
+
+        relevant_count += 1;
+        let (grant_tx, grant_rx) = mpsc::channel(local_lock_keys.len().max(1));
+        if !local_lock_keys.is_empty() {
+            lock_table.enqueue(tx.tx_id, &local_lock_keys, grant_tx);
+        }
+        let remote_rx = if active.contains(&core.shard_id) {
+            Some(
+                core.mailboxes
+                    .receiver(
+                        batch.batch_id,
+                        tx.tx_id,
+                        ReadPhase::AriaFallback,
+                        read_sources.len().max(1),
+                    )
+                    .await?,
+            )
+        } else {
+            None
+        };
+        spawn_aria_fallback_worker(AriaFallbackWorker {
+            core: core.clone(),
+            batch_id: batch.batch_id,
+            tx,
+            result_shard,
+            active,
+            read_sources,
+            local_lock_keys,
+            local_read_keys,
+            local_write_keys,
+            grant_rx,
+            remote_rx,
+            outcome_tx: outcome_tx.clone(),
+        });
+    }
+    drop(outcome_tx);
+
+    lock_table.grant_initial_heads().await?;
+
+    let mut tx_results = Vec::new();
+    let mut active_results: BTreeMap<TxId, TxResult> = BTreeMap::new();
+    for _ in 0..relevant_count {
+        let outcome = outcome_rx.recv().await.ok_or_else(|| {
+            Error::ChannelClosed("Aria fallback outcome channel closed".to_string())
+        })?;
+        lock_table
+            .release_and_grant_next(outcome.tx_id, &outcome.local_lock_keys)
+            .await?;
+        match outcome.result? {
+            AriaFallbackCompletion::Active { result, record } => {
+                if let Some(previous) = active_results.insert(outcome.tx_id, result) {
+                    if previous != result {
+                        return Err(Error::InvalidBatch(format!(
+                            "Aria fallback active executors disagree for tx {}: {:?} vs {:?}",
+                            outcome.tx_id, previous, result
+                        )));
+                    }
+                }
+                if let Some(record) = record {
+                    tx_results.push(record);
+                }
+            }
+            AriaFallbackCompletion::Passive => {}
+        }
+    }
+    tx_results.sort_by_key(|record| (record.tx_id, record.shard_id));
+    Ok(ProfiledBatchExecution {
+        summary: BatchExecutionSummary {
+            batch_id: batch.batch_id,
+            shard_id: core.shard_id,
+            tx_results,
+        },
+        profile: None,
+    })
+}
+
+fn aria_fallback_active_shards(layout: &ShardLayout, tx: &OrderedTx) -> BTreeSet<ShardId> {
+    let mut active = owner_shards_for_keys(layout, &tx.write_set);
+    active.insert(aria_result_shard(tx.tx_id, layout.shard_count));
+    active
+}
+
+fn owner_shards_for_keys(layout: &ShardLayout, keys: &BTreeSet<Key>) -> BTreeSet<ShardId> {
+    keys.iter().map(|key| layout.shard_for_key(key)).collect()
+}
+
+fn fallback_batch_from_failed_indices_with_derived_sets(
+    batch: &Batch,
+    failed_indices: &BTreeSet<usize>,
+) -> Result<Batch> {
+    let mut txs = Vec::with_capacity(failed_indices.len());
+    for (fallback_index, original_index) in failed_indices.iter().enumerate() {
+        let mut tx = tx_with_derived_sets(&batch.txs[*original_index])?;
+        tx.batch_index = fallback_index as u32;
+        txs.push(tx);
+    }
+    Ok(Batch {
+        batch_id: batch.batch_id,
+        txs,
+    })
+}
+
+struct AriaFallbackWorker {
+    core: Arc<ShardCore>,
+    batch_id: BatchId,
+    tx: OrderedTx,
+    result_shard: ShardId,
+    active: BTreeSet<ShardId>,
+    read_sources: BTreeSet<ShardId>,
+    local_lock_keys: BTreeSet<Key>,
+    local_read_keys: BTreeSet<Key>,
+    local_write_keys: BTreeSet<Key>,
+    grant_rx: mpsc::Receiver<LockGrant>,
+    remote_rx: Option<mpsc::Receiver<LocalReadResult>>,
+    outcome_tx: mpsc::Sender<AriaFallbackOutcome>,
+}
+
+struct AriaFallbackOutcome {
+    tx_id: TxId,
+    local_lock_keys: BTreeSet<Key>,
+    result: Result<AriaFallbackCompletion>,
+}
+
+enum AriaFallbackCompletion {
+    Active {
+        result: TxResult,
+        record: Option<TxResultRecord>,
+    },
+    Passive,
+}
+
+fn spawn_aria_fallback_worker(worker: AriaFallbackWorker) {
+    tokio::spawn(async move {
+        let tx_id = worker.tx.tx_id;
+        let local_lock_keys = worker.local_lock_keys.clone();
+        let outcome_tx = worker.outcome_tx.clone();
+        let result = worker.run().await;
+        let _ = outcome_tx
+            .send(AriaFallbackOutcome {
+                tx_id,
+                local_lock_keys,
+                result,
+            })
+            .await;
+    });
+}
+
+impl AriaFallbackWorker {
+    async fn run(mut self) -> Result<AriaFallbackCompletion> {
+        self.wait_for_lock_grants().await?;
+        let local_reads = self.core.store.read_many(&self.local_read_keys)?;
+        if self.read_sources.contains(&self.core.shard_id) {
+            self.send_local_reads(&local_reads).await?;
+        }
+        if !self.active.contains(&self.core.shard_id) {
+            return Ok(AriaFallbackCompletion::Passive);
+        }
+        let full_reads = self.collect_full_reads(local_reads).await?;
+        let output = execute_deterministic(&self.tx, &full_reads);
+        let result = output.result;
+        let local_writes =
+            filter_local_writes(output.writes, self.core.shard_id, &self.core.layout);
+        self.validate_local_writes(&local_writes)?;
+        self.core.store.apply_writes_atomically(&local_writes)?;
+        let record = if self.result_shard == self.core.shard_id {
+            self.core
+                .client_results
+                .mark_ready(self.tx.tx_id, result)
+                .await;
+            Some(TxResultRecord {
+                tx_id: self.tx.tx_id,
+                shard_id: self.core.shard_id,
+                result,
+            })
+        } else {
+            None
+        };
+        Ok(AriaFallbackCompletion::Active { result, record })
+    }
+
+    async fn wait_for_lock_grants(&mut self) -> Result<()> {
+        let mut granted = BTreeSet::new();
+        while granted.len() < self.local_lock_keys.len() {
+            let grant = self.grant_rx.recv().await.ok_or_else(|| {
+                Error::ChannelClosed(format!(
+                    "Aria fallback lock grant receiver closed for tx {}",
+                    self.tx.tx_id
+                ))
+            })?;
+            if !self.local_lock_keys.contains(&grant.key) {
+                return Err(Error::LockInvariant(format!(
+                    "Aria fallback tx {} got unexpected lock grant for key {}",
+                    self.tx.tx_id, grant.key
+                )));
+            }
+            if !granted.insert(grant.key.clone()) {
+                return Err(Error::LockInvariant(format!(
+                    "Aria fallback tx {} got duplicate lock grant for key {}",
+                    self.tx.tx_id, grant.key
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    async fn send_local_reads(&self, local_reads: &BTreeMap<Key, ReadValue>) -> Result<usize> {
+        let mut sent = 0usize;
+        for target in &self.active {
+            if *target == self.core.shard_id {
+                continue;
+            }
+            let endpoint = self
+                .core
+                .peer_endpoints
+                .get(target)
+                .ok_or(Error::MissingPeer(*target))?
+                .clone();
+            let request = pb::LocalReadResultRequest {
+                batch_id: self.batch_id,
+                tx_id: self.tx.tx_id,
+                from_shard: self.core.shard_id,
+                reads: read_entries_to_proto(local_reads),
+                phase: read_phase_to_i32(ReadPhase::AriaFallback),
+                status: local_read_status_to_i32(LocalReadStatus::Ok),
+            };
+            let mut client = pb::shard_client::ShardClient::connect(endpoint).await?;
+            client.local_read_result(request).await?;
+            sent += 1;
+        }
+        Ok(sent)
+    }
+
+    async fn collect_full_reads(
+        &mut self,
+        local_reads: BTreeMap<Key, ReadValue>,
+    ) -> Result<BTreeMap<Key, ReadValue>> {
+        let mut full_reads = local_reads;
+        let expected_remote: BTreeSet<ShardId> = self
+            .read_sources
+            .iter()
+            .copied()
+            .filter(|shard| *shard != self.core.shard_id)
+            .collect();
+        let remote_rx = self.remote_rx.as_mut().ok_or_else(|| {
+            Error::InvalidBatch(format!(
+                "Aria fallback active tx {} has no remote read mailbox",
+                self.tx.tx_id
+            ))
+        })?;
+        let mut received = BTreeSet::new();
+        while received.len() < expected_remote.len() {
+            let msg = remote_rx.recv().await.ok_or_else(|| {
+                Error::ChannelClosed(format!(
+                    "Aria fallback remote read mailbox closed for tx {}",
+                    self.tx.tx_id
+                ))
+            })?;
+            if msg.batch_id != self.batch_id
+                || msg.tx_id != self.tx.tx_id
+                || msg.phase != ReadPhase::AriaFallback
+            {
+                return Err(Error::InvalidBatch(format!(
+                    "Aria fallback read result routed to wrong target for tx {}",
+                    self.tx.tx_id
+                )));
+            }
+            if !expected_remote.contains(&msg.from_shard) {
+                return Err(Error::InvalidBatch(format!(
+                    "unexpected Aria fallback read result for tx {} from shard {}",
+                    self.tx.tx_id, msg.from_shard
+                )));
+            }
+            if !received.insert(msg.from_shard) {
+                return Err(Error::InvalidBatch(format!(
+                    "duplicate Aria fallback read result for tx {} from shard {}",
+                    self.tx.tx_id, msg.from_shard
+                )));
+            }
+            if msg.status != LocalReadStatus::Ok {
+                return Err(Error::InvalidBatch(format!(
+                    "Aria fallback read result for tx {} from shard {} has status {:?}",
+                    self.tx.tx_id, msg.from_shard, msg.status
+                )));
+            }
+            let expected_keys = self.core.layout.local_read_keys(&self.tx, msg.from_shard);
+            let actual_keys: BTreeSet<Key> = msg.reads.keys().cloned().collect();
+            if actual_keys != expected_keys {
+                return Err(Error::InvalidBatch(format!(
+                    "Aria fallback tx {} read keys from shard {} mismatch: expected {:?}, got {:?}",
+                    self.tx.tx_id, msg.from_shard, expected_keys, actual_keys
+                )));
+            }
+            for (key, value) in msg.reads {
+                if full_reads.insert(key.clone(), value).is_some() {
+                    return Err(Error::InvalidBatch(format!(
+                        "duplicate Aria fallback full read key {} for tx {}",
+                        key, self.tx.tx_id
+                    )));
+                }
+            }
+        }
+        let full_keys: BTreeSet<Key> = full_reads.keys().cloned().collect();
+        if full_keys != self.tx.read_set {
+            return Err(Error::InvalidBatch(format!(
+                "Aria fallback tx {} full read set mismatch: expected {:?}, got {:?}",
+                self.tx.tx_id, self.tx.read_set, full_keys
+            )));
+        }
+        Ok(full_reads)
+    }
+
+    fn validate_local_writes(&self, writes: &[crate::model::WriteOp]) -> Result<()> {
+        for write in writes {
+            let key = write.key();
+            if !self.local_write_keys.contains(key) {
+                return Err(Error::InvalidBatch(format!(
+                    "Aria fallback tx {} tried to write unexpected key {} on shard {}",
+                    self.tx.tx_id, key, self.core.shard_id
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 fn new_scheduler_profile(
@@ -1549,10 +2404,19 @@ async fn record_scc_reorder(
     batch_len: usize,
     failed_indices: &BTreeSet<usize>,
 ) -> Result<()> {
+    record_batch_reorder(core, batch_id, batch_len, failed_indices).await
+}
+
+async fn record_batch_reorder(
+    core: Arc<ShardCore>,
+    batch_id: BatchId,
+    batch_len: usize,
+    failed_indices: &BTreeSet<usize>,
+) -> Result<()> {
     let all_indices: BTreeSet<usize> = (0..batch_len).collect();
     if !failed_indices.is_subset(&all_indices) {
         return Err(Error::InvalidBatch(format!(
-            "SCC failed set {:?} contains index outside batch length {}",
+            "batch failed set {:?} contains index outside batch length {}",
             failed_indices, batch_len
         )));
     }
@@ -1566,7 +2430,7 @@ async fn record_scc_reorder(
     let mut reorders = core.scc_reorders.lock().await;
     if reorders.insert(batch_id, record).is_some() {
         return Err(Error::InvalidBatch(format!(
-            "duplicate SCC reorder record for batch {}",
+            "duplicate batch reorder record for batch {}",
             batch_id
         )));
     }
@@ -1712,6 +2576,264 @@ fn new_mailbox(capacity: usize) -> MailboxEntry {
     }
 }
 
+impl AriaBatchRegistry {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    async fn entry(&self, batch_id: BatchId) -> Arc<AriaBatchEntry> {
+        let mut inner = self.inner.lock().await;
+        inner
+            .entry(batch_id)
+            .or_insert_with(|| {
+                Arc::new(AriaBatchEntry {
+                    state: Mutex::new(AriaBatchState::default()),
+                    notify: Notify::new(),
+                })
+            })
+            .clone()
+    }
+
+    async fn read_snapshot(
+        &self,
+        core: Arc<ShardCore>,
+        batch_id: BatchId,
+        tx_index: usize,
+        _tx_id: TxId,
+        _from_shard: ShardId,
+        key: Key,
+    ) -> Result<ReadValue> {
+        let owner = core.layout.shard_for_key(&key);
+        if owner != core.shard_id {
+            return Err(Error::InvalidBatch(format!(
+                "Aria read for key {} routed to shard {}, owner is {}",
+                key, core.shard_id, owner
+            )));
+        }
+        let mut keys = BTreeSet::new();
+        keys.insert(key.clone());
+        let value = core.store.read_many(&keys)?.remove(&key).ok_or_else(|| {
+            Error::InvalidBatch(format!("missing Aria read value for key {}", key))
+        })?;
+        let entry = self.entry(batch_id).await;
+        {
+            let mut state = entry.state.lock().await;
+            state
+                .readers_by_key
+                .entry(key)
+                .or_default()
+                .insert(tx_index);
+        }
+        entry.notify.notify_waiters();
+        Ok(value)
+    }
+
+    async fn stage_outcome(&self, core: Arc<ShardCore>, outcome: AriaStageOutcome) -> Result<()> {
+        let expected_from = aria_result_shard(outcome.tx_id, core.layout.shard_count);
+        if outcome.from_shard != expected_from {
+            return Err(Error::InvalidBatch(format!(
+                "Aria staged outcome for tx {} came from shard {}, expected {}",
+                outcome.tx_id, outcome.from_shard, expected_from
+            )));
+        }
+        let is_result_shard = core.shard_id == expected_from;
+        if outcome.is_result_shard != is_result_shard {
+            return Err(Error::InvalidBatch(format!(
+                "Aria staged outcome for tx {} has is_result_shard={}, expected {} on shard {}",
+                outcome.tx_id, outcome.is_result_shard, is_result_shard, core.shard_id
+            )));
+        }
+        for write in &outcome.writes {
+            let owner = core.layout.shard_for_key(write.key());
+            if owner != core.shard_id {
+                return Err(Error::InvalidBatch(format!(
+                    "Aria staged write for key {} routed to shard {}, owner is {}",
+                    write.key(),
+                    core.shard_id,
+                    owner
+                )));
+            }
+        }
+
+        let entry = self.entry(outcome.batch_id).await;
+        {
+            let mut state = entry.state.lock().await;
+            if state
+                .staged_outcomes
+                .insert(
+                    outcome.tx_index,
+                    AriaStagedOutcome {
+                        tx_index: outcome.tx_index,
+                        tx_id: outcome.tx_id,
+                        result: outcome.is_result_shard.then_some(outcome.result),
+                        local_writes: outcome.writes.clone(),
+                        is_result_shard: outcome.is_result_shard,
+                    },
+                )
+                .is_some()
+            {
+                return Err(Error::InvalidBatch(format!(
+                    "duplicate Aria staged outcome for batch {} tx index {} on shard {}",
+                    outcome.batch_id, outcome.tx_index, core.shard_id
+                )));
+            }
+            for write in outcome.writes {
+                state
+                    .writers_by_key
+                    .entry(write.key().clone())
+                    .or_default()
+                    .insert(outcome.tx_index);
+            }
+        }
+        entry.notify.notify_waiters();
+        Ok(())
+    }
+
+    async fn record_execution_done(
+        &self,
+        batch_id: BatchId,
+        from_shard: ShardId,
+        shard_count: ShardId,
+    ) -> Result<()> {
+        validate_aria_report_shard(batch_id, from_shard, shard_count)?;
+        let entry = self.entry(batch_id).await;
+        {
+            let mut state = entry.state.lock().await;
+            if !state.execution_done_reports.insert(from_shard) {
+                return Err(Error::InvalidBatch(format!(
+                    "duplicate Aria execution-done report for batch {} from shard {}",
+                    batch_id, from_shard
+                )));
+            }
+        }
+        entry.notify.notify_waiters();
+        Ok(())
+    }
+
+    async fn record_local_failures(
+        &self,
+        batch_id: BatchId,
+        from_shard: ShardId,
+        failed_indices: BTreeSet<usize>,
+        shard_count: ShardId,
+    ) -> Result<()> {
+        validate_aria_report_shard(batch_id, from_shard, shard_count)?;
+        let entry = self.entry(batch_id).await;
+        {
+            let mut state = entry.state.lock().await;
+            if state
+                .failure_reports
+                .insert(from_shard, failed_indices)
+                .is_some()
+            {
+                return Err(Error::InvalidBatch(format!(
+                    "duplicate Aria local-failure report for batch {} from shard {}",
+                    batch_id, from_shard
+                )));
+            }
+        }
+        entry.notify.notify_waiters();
+        Ok(())
+    }
+
+    async fn wait_execution_done(&self, batch_id: BatchId, shard_count: usize) -> Result<()> {
+        let entry = self.entry(batch_id).await;
+        loop {
+            {
+                let state = entry.state.lock().await;
+                if has_all_aria_reports(&state.execution_done_reports, shard_count) {
+                    return Ok(());
+                }
+            }
+            entry.notify.notified().await;
+        }
+    }
+
+    async fn wait_failure_reports(
+        &self,
+        batch_id: BatchId,
+        shard_count: usize,
+    ) -> Result<BTreeSet<usize>> {
+        let entry = self.entry(batch_id).await;
+        loop {
+            {
+                let state = entry.state.lock().await;
+                let reported_shards: BTreeSet<ShardId> =
+                    state.failure_reports.keys().copied().collect();
+                if has_all_aria_reports(&reported_shards, shard_count) {
+                    return Ok(state
+                        .failure_reports
+                        .values()
+                        .flat_map(|indices| indices.iter().copied())
+                        .collect());
+                }
+            }
+            entry.notify.notified().await;
+        }
+    }
+
+    async fn local_failed_indices(&self, batch_id: BatchId) -> BTreeSet<usize> {
+        let entry = self.entry(batch_id).await;
+        let state = entry.state.lock().await;
+        let mut failed = BTreeSet::new();
+        for key in state
+            .writers_by_key
+            .keys()
+            .chain(state.readers_by_key.keys())
+        {
+            let writers = state.writers_by_key.get(key);
+            let Some(writers) = writers else {
+                continue;
+            };
+            let Some(winner) = writers.iter().next().copied() else {
+                continue;
+            };
+            for writer in writers {
+                if *writer != winner {
+                    failed.insert(*writer);
+                }
+            }
+            if let Some(readers) = state.readers_by_key.get(key) {
+                for reader in readers {
+                    if winner < *reader {
+                        failed.insert(*reader);
+                    }
+                }
+            }
+        }
+        failed
+    }
+
+    async fn staged_outcomes(&self, batch_id: BatchId) -> Vec<AriaStagedOutcome> {
+        let entry = self.entry(batch_id).await;
+        let state = entry.state.lock().await;
+        state.staged_outcomes.values().cloned().collect()
+    }
+
+    async fn cleanup_batch(&self, batch_id: BatchId) {
+        let mut inner = self.inner.lock().await;
+        inner.remove(&batch_id);
+    }
+}
+
+fn validate_aria_report_shard(
+    batch_id: BatchId,
+    from_shard: ShardId,
+    shard_count: ShardId,
+) -> Result<()> {
+    if from_shard >= shard_count {
+        return Err(Error::InvalidBatch(format!(
+            "Aria report for batch {} came from shard {}, but shard_count is {}",
+            batch_id, from_shard, shard_count
+        )));
+    }
+    Ok(())
+}
+
+fn has_all_aria_reports(reported_shards: &BTreeSet<ShardId>, shard_count: usize) -> bool {
+    (0..shard_count).all(|shard| reported_shards.contains(&(shard as ShardId)))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ClientTxResult {
     Ready(TxResult),
@@ -1804,12 +2926,20 @@ pub struct SequencerConfig {
     pub shard_endpoints: BTreeMap<ShardId, String>,
     pub max_batch_size: usize,
     pub batch_flush_interval: Duration,
+    pub result_policy: SequencerResultPolicy,
 }
 
 impl SequencerConfig {
     pub fn default_batch_flush_interval() -> Duration {
         DEFAULT_BATCH_FLUSH_INTERVAL
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SequencerResultPolicy {
+    #[default]
+    StaticReadWriteSet,
+    TxIdModulo,
 }
 
 pub struct SequencerRuntime {
@@ -1845,6 +2975,7 @@ impl SequencerRuntime {
         ));
         tokio::spawn(run_sequencer_actor(SequencerActor {
             layout: layout.clone(),
+            result_policy: config.result_policy,
             max_batch_size: config.max_batch_size,
             batch_flush_interval: config.batch_flush_interval,
             next_batch_id: 1,
@@ -1914,6 +3045,7 @@ enum SequencerCommand {
 
 struct SequencerActor {
     layout: ShardLayout,
+    result_policy: SequencerResultPolicy,
     max_batch_size: usize,
     batch_flush_interval: Duration,
     next_batch_id: BatchId,
@@ -1963,10 +3095,7 @@ impl SequencerActor {
     async fn handle_submit_tx(&mut self, op: FsOp) -> Result<SubmitTxAck> {
         let tx_id = self.next_tx_id;
         let (read_set, write_set) = derive_read_write_set(&op)?;
-        let result_shard = self
-            .layout
-            .result_shard_for_sets(&read_set, &write_set)
-            .ok_or_else(|| Error::InvalidBatch(format!("tx {} has no result shard", tx_id)))?;
+        let result_shard = self.result_shard_for_tx(tx_id, &read_set, &write_set)?;
         let max_batch_size = self.max_batch_size;
         let should_flush = {
             let batch = self.ensure_open_batch();
@@ -2100,6 +3229,23 @@ impl SequencerActor {
         let batch_id = self.next_batch_id;
         self.next_batch_id += 1;
         batch_id
+    }
+
+    fn result_shard_for_tx(
+        &self,
+        tx_id: TxId,
+        read_set: &BTreeSet<Key>,
+        write_set: &BTreeSet<Key>,
+    ) -> Result<ShardId> {
+        match self.result_policy {
+            SequencerResultPolicy::StaticReadWriteSet => self
+                .layout
+                .result_shard_for_sets(read_set, write_set)
+                .ok_or_else(|| Error::InvalidBatch(format!("tx {} has no result shard", tx_id))),
+            SequencerResultPolicy::TxIdModulo => {
+                Ok(aria_result_shard(tx_id, self.layout.shard_count))
+            }
+        }
     }
 }
 

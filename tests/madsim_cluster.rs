@@ -10,7 +10,8 @@ use calvinfs_demo::convert::{
     scheduler_profile_records_from_proto, tx_result_from_i32, tx_result_records_from_proto,
 };
 use calvinfs_demo::engine::{
-    SchedulerKind, SequencerConfig, SequencerRuntime, ShardConfig, ShardRuntime,
+    SchedulerKind, SequencerConfig, SequencerResultPolicy, SequencerRuntime, ShardConfig,
+    ShardRuntime,
 };
 use calvinfs_demo::executor::derive_read_write_set;
 use calvinfs_demo::model::{
@@ -241,6 +242,9 @@ async fn scheduler_profiles_dump_state() -> Result<()> {
     let scc_profiles = run_scheduler_profile_cluster(BenchmarkScheduler::Scc, 61).await?;
     assert_profile_batch(&scc_profiles, SchedulerProfileScheduler::SccOnline, 1)?;
 
+    let aria_profiles = run_scheduler_profile_cluster(BenchmarkScheduler::Aria, 62).await?;
+    assert_profile_batch(&aria_profiles, SchedulerProfileScheduler::Aria, 0)?;
+
     Ok(())
 }
 
@@ -261,11 +265,17 @@ async fn mdtest_like_client_workload() -> Result<()> {
         run_mdtest_like_cluster(BenchmarkScheduler::Scc, MdtestMode::Private, config, 40).await?;
     let scc_public_summary =
         run_mdtest_like_cluster(BenchmarkScheduler::Scc, MdtestMode::Public, config, 50).await?;
+    let aria_private_summary =
+        run_mdtest_like_cluster(BenchmarkScheduler::Aria, MdtestMode::Private, config, 70).await?;
+    let aria_public_summary =
+        run_mdtest_like_cluster(BenchmarkScheduler::Aria, MdtestMode::Public, config, 80).await?;
 
     print_mode_summary(&calvin_private_summary, config.show_ranks);
     print_mode_summary(&calvin_public_summary, config.show_ranks);
     print_mode_summary(&scc_private_summary, config.show_ranks);
     print_mode_summary(&scc_public_summary, config.show_ranks);
+    print_mode_summary(&aria_private_summary, config.show_ranks);
+    print_mode_summary(&aria_public_summary, config.show_ranks);
     print_private_public_comparison(
         BenchmarkScheduler::Calvin,
         &calvin_private_summary,
@@ -276,6 +286,11 @@ async fn mdtest_like_client_workload() -> Result<()> {
         &scc_private_summary,
         &scc_public_summary,
     );
+    print_private_public_comparison(
+        BenchmarkScheduler::Aria,
+        &aria_private_summary,
+        &aria_public_summary,
+    );
     print_scheduler_comparison(
         MdtestMode::Private,
         &calvin_private_summary,
@@ -285,6 +300,26 @@ async fn mdtest_like_client_workload() -> Result<()> {
         MdtestMode::Public,
         &calvin_public_summary,
         &scc_public_summary,
+    );
+    print_scheduler_comparison(
+        MdtestMode::Private,
+        &calvin_private_summary,
+        &aria_private_summary,
+    );
+    print_scheduler_comparison(
+        MdtestMode::Public,
+        &calvin_public_summary,
+        &aria_public_summary,
+    );
+    print_scheduler_comparison(
+        MdtestMode::Private,
+        &scc_private_summary,
+        &aria_private_summary,
+    );
+    print_scheduler_comparison(
+        MdtestMode::Public,
+        &scc_public_summary,
+        &aria_public_summary,
     );
 
     Ok(())
@@ -315,7 +350,11 @@ async fn md_workbench_like_client_workload() -> Result<()> {
     let mut summaries = Vec::new();
     let mut network = 70u8;
     for scenario in scenarios {
-        for scheduler in [BenchmarkScheduler::Calvin, BenchmarkScheduler::Scc] {
+        for scheduler in [
+            BenchmarkScheduler::Calvin,
+            BenchmarkScheduler::Scc,
+            BenchmarkScheduler::Aria,
+        ] {
             summaries
                 .push(run_mdwb_like_cluster(scheduler, scenario, config.clone(), network).await?);
             network = network
@@ -926,6 +965,7 @@ async fn run_mdtest_like_cluster(
         shard_endpoints.clone(),
         config.batch_size,
         SequencerConfig::default_batch_flush_interval(),
+        scheduler.sequencer_result_policy(),
     );
 
     let driver = madsim::runtime::Handle::current()
@@ -977,6 +1017,7 @@ async fn run_scheduler_profile_cluster(
         shard_endpoints.clone(),
         BATCH_SIZE,
         SequencerConfig::default_batch_flush_interval(),
+        scheduler.sequencer_result_policy(),
     );
 
     let driver = madsim::runtime::Handle::current()
@@ -1145,6 +1186,7 @@ async fn run_mdtest_like_client_driver(
 enum BenchmarkScheduler {
     Calvin,
     Scc,
+    Aria,
 }
 
 impl BenchmarkScheduler {
@@ -1152,6 +1194,7 @@ impl BenchmarkScheduler {
         match self {
             Self::Calvin => "calvin",
             Self::Scc => "scc",
+            Self::Aria => "aria",
         }
     }
 
@@ -1159,6 +1202,7 @@ impl BenchmarkScheduler {
         match self {
             Self::Calvin => "Calvin",
             Self::Scc => "SCC",
+            Self::Aria => "Aria",
         }
     }
 
@@ -1166,6 +1210,14 @@ impl BenchmarkScheduler {
         match self {
             Self::Calvin => SchedulerKind::CalvinLocking,
             Self::Scc => SchedulerKind::SccOnline,
+            Self::Aria => SchedulerKind::Aria,
+        }
+    }
+
+    fn sequencer_result_policy(self) -> SequencerResultPolicy {
+        match self {
+            Self::Aria => SequencerResultPolicy::TxIdModulo,
+            Self::Calvin | Self::Scc => SequencerResultPolicy::StaticReadWriteSet,
         }
     }
 }
@@ -1704,6 +1756,7 @@ async fn run_mdwb_like_cluster(
         shard_endpoints.clone(),
         config.batch_size,
         SequencerConfig::default_batch_flush_interval(),
+        scheduler.sequencer_result_policy(),
     );
 
     let driver = madsim::runtime::Handle::current()
@@ -2998,33 +3051,40 @@ fn print_private_public_comparison(
 
 fn print_scheduler_comparison(
     mode: MdtestMode,
-    calvin_summary: &ModeSummary,
-    scc_summary: &ModeSummary,
+    left_summary: &ModeSummary,
+    right_summary: &ModeSummary,
 ) {
+    let left = left_summary.scheduler;
+    let right = right_summary.scheduler;
     println!(
-        "\n{} SCC/Calvin comparison:",
-        mode.name().to_ascii_uppercase()
+        "\n{} {}/{} comparison:",
+        mode.name().to_ascii_uppercase(),
+        right.display_name(),
+        left.display_name()
     );
     println!(
         "{:<22} {:>16} {:>16} {:>16}",
-        "Operation", "Calvin ops/s", "SCC ops/s", "SCC/Calvin"
+        "Operation",
+        format!("{} ops/s", left.display_name()),
+        format!("{} ops/s", right.display_name()),
+        format!("{}/{}", right.display_name(), left.display_name())
     );
-    for calvin_phase in &calvin_summary.phases {
-        let scc_phase = scc_summary
+    for left_phase in &left_summary.phases {
+        let right_phase = right_summary
             .phases
             .iter()
-            .find(|phase| phase.phase == calvin_phase.phase)
-            .expect("SCC summary should contain same phase");
-        let ratio = if calvin_phase.aggregate_ops_per_sec == 0.0 {
+            .find(|phase| phase.phase == left_phase.phase)
+            .expect("right summary should contain same phase");
+        let ratio = if left_phase.aggregate_ops_per_sec == 0.0 {
             0.0
         } else {
-            scc_phase.aggregate_ops_per_sec / calvin_phase.aggregate_ops_per_sec
+            right_phase.aggregate_ops_per_sec / left_phase.aggregate_ops_per_sec
         };
         println!(
             "{:<22} {:>16.3} {:>16.3} {:>16.3}",
-            calvin_phase.phase.name(),
-            calvin_phase.aggregate_ops_per_sec,
-            scc_phase.aggregate_ops_per_sec,
+            left_phase.phase.name(),
+            left_phase.aggregate_ops_per_sec,
+            right_phase.aggregate_ops_per_sec,
             ratio
         );
     }
@@ -3189,13 +3249,15 @@ fn print_mdwb_scheduler_comparison(summaries: &[MdwbSummary]) -> Result<()> {
         }
     }
 
-    println!("\nmd-workbench-like SCC/Calvin benchmark comparison:");
+    println!("\nmd-workbench-like scheduler benchmark comparison:");
     println!(
-        "{:<24} {:>12} {:>12} {:>12} {:>10} {:>14} {:>18}",
+        "{:<24} {:>12} {:>12} {:>12} {:>12} {:>12} {:>10} {:>14} {:>18}",
         "Scenario",
         "Calvin ops/s",
         "SCC ops/s",
         "SCC/Calvin",
+        "Aria ops/s",
+        "Aria/Calvin",
         "Max fan-in",
         "Key conflicts",
         "Mode"
@@ -3213,19 +3275,33 @@ fn print_mdwb_scheduler_comparison(summaries: &[MdwbSummary]) -> Result<()> {
                 summary.scenario == scenario && summary.scheduler == BenchmarkScheduler::Scc
             })
             .ok_or_else(|| anyhow::anyhow!("missing SCC summary for {}", scenario.name()))?;
+        let aria = summaries
+            .iter()
+            .find(|summary| {
+                summary.scenario == scenario && summary.scheduler == BenchmarkScheduler::Aria
+            })
+            .ok_or_else(|| anyhow::anyhow!("missing Aria summary for {}", scenario.name()))?;
         let calvin_rate = mdwb_benchmark_ops_per_sec(calvin);
         let scc_rate = mdwb_benchmark_ops_per_sec(scc);
-        let ratio = if calvin_rate == 0.0 {
+        let aria_rate = mdwb_benchmark_ops_per_sec(aria);
+        let scc_ratio = if calvin_rate == 0.0 {
             0.0
         } else {
             scc_rate / calvin_rate
         };
+        let aria_ratio = if calvin_rate == 0.0 {
+            0.0
+        } else {
+            aria_rate / calvin_rate
+        };
         println!(
-            "{:<24} {:>12.3} {:>12.3} {:>12.3} {:>10} {:>14} {:>18}",
+            "{:<24} {:>12.3} {:>12.3} {:>12.3} {:>12.3} {:>12.3} {:>10} {:>14} {:>18}",
             scenario.name(),
             calvin_rate,
             scc_rate,
-            ratio,
+            scc_ratio,
+            aria_rate,
+            aria_ratio,
             calvin.conflict.max_clients_per_parent,
             calvin.conflict.cross_rank_key_conflicts,
             scenario.mode_name()
@@ -3912,6 +3988,7 @@ fn start_sequencer_node_with_config(
         shard_endpoints,
         max_batch_size,
         batch_flush_interval,
+        SequencerResultPolicy::StaticReadWriteSet,
     );
 }
 
@@ -3921,6 +3998,7 @@ fn start_sequencer_node_with_config_and_name(
     shard_endpoints: BTreeMap<ShardId, String>,
     max_batch_size: usize,
     batch_flush_interval: Duration,
+    result_policy: SequencerResultPolicy,
 ) {
     let node = madsim::runtime::Handle::current()
         .create_node()
@@ -3934,6 +4012,7 @@ fn start_sequencer_node_with_config_and_name(
             shard_endpoints,
             max_batch_size,
             batch_flush_interval,
+            result_policy,
         }));
         let addr = SocketAddr::new(ip, SEQUENCER_PORT);
         Server::builder()

@@ -2,7 +2,7 @@ use crate::error::{Error, Result};
 use crate::model::{
     Batch, FsOp, Inode, Key, LocalReadStatus, NodeKind, OrderedTx, ReadPhase, ReadValue,
     SccReorderRecord, SchedulerProfileCounters, SchedulerProfileRecord, SchedulerProfileScheduler,
-    SchedulerProfileTimings, TxResult, TxResultRecord, WorkerStageStats,
+    SchedulerProfileTimings, TxResult, TxResultRecord, WorkerStageStats, WriteOp,
 };
 use crate::proto::pb;
 use std::collections::{BTreeMap, BTreeSet};
@@ -149,6 +149,66 @@ pub fn read_entries_to_proto(reads: &BTreeMap<Key, ReadValue>) -> Vec<pb::ReadEn
             }
         })
         .collect()
+}
+
+pub fn read_entry_from_proto(entry: Option<pb::ReadEntry>) -> Result<(Key, ReadValue)> {
+    let entry = entry.ok_or_else(|| Error::InvalidProto("missing read entry".to_string()))?;
+    let key = Key::new(entry.key)?;
+    let value = match entry
+        .value
+        .ok_or_else(|| Error::InvalidProto("missing read value".to_string()))?
+    {
+        pb::read_entry::Value::Inode(inode) => ReadValue::Present(inode_from_proto(Some(inode))?),
+        pb::read_entry::Value::Missing(_) => ReadValue::Missing,
+    };
+    Ok((key, value))
+}
+
+pub fn read_entry_to_proto(key: &Key, value: &ReadValue) -> pb::ReadEntry {
+    let value = match value {
+        ReadValue::Present(inode) => pb::read_entry::Value::Inode(inode_to_proto(inode)),
+        ReadValue::Missing => pb::read_entry::Value::Missing(pb::Missing {}),
+    };
+    pb::ReadEntry {
+        key: String::from(key),
+        value: Some(value),
+    }
+}
+
+pub fn write_entries_from_proto(entries: Vec<pb::WriteEntry>) -> Result<Vec<WriteOp>> {
+    entries.into_iter().map(write_entry_from_proto).collect()
+}
+
+pub fn write_entries_to_proto(writes: &[WriteOp]) -> Vec<pb::WriteEntry> {
+    writes.iter().map(write_entry_to_proto).collect()
+}
+
+fn write_entry_from_proto(entry: pb::WriteEntry) -> Result<WriteOp> {
+    let op = entry
+        .op
+        .ok_or_else(|| Error::InvalidProto("missing write op".to_string()))?;
+    Ok(match op {
+        pb::write_entry::Op::Put(put) => WriteOp::Put {
+            key: Key::new(put.key)?,
+            value: inode_from_proto(put.inode)?,
+        },
+        pb::write_entry::Op::Delete(delete) => WriteOp::Delete {
+            key: Key::new(delete.key)?,
+        },
+    })
+}
+
+fn write_entry_to_proto(write: &WriteOp) -> pb::WriteEntry {
+    let op = match write {
+        WriteOp::Put { key, value } => pb::write_entry::Op::Put(pb::PutEntry {
+            key: String::from(key),
+            inode: Some(inode_to_proto(value)),
+        }),
+        WriteOp::Delete { key } => pb::write_entry::Op::Delete(pb::DeleteEntry {
+            key: String::from(key),
+        }),
+    };
+    pb::WriteEntry { op: Some(op) }
 }
 
 pub fn inode_entries_to_proto(entries: &BTreeMap<Key, Inode>) -> Vec<pb::InodeEntry> {
@@ -446,6 +506,7 @@ pub fn scheduler_profile_scheduler_to_i32(value: SchedulerProfileScheduler) -> i
     match value {
         SchedulerProfileScheduler::CalvinLocking => 1,
         SchedulerProfileScheduler::SccOnline => 2,
+        SchedulerProfileScheduler::Aria => 3,
     }
 }
 
@@ -453,6 +514,7 @@ pub fn scheduler_profile_scheduler_from_i32(value: i32) -> Result<SchedulerProfi
     Ok(match value {
         1 => SchedulerProfileScheduler::CalvinLocking,
         2 => SchedulerProfileScheduler::SccOnline,
+        3 => SchedulerProfileScheduler::Aria,
         _ => {
             return Err(Error::InvalidProto(format!(
                 "invalid SchedulerProfileScheduler {}",
@@ -490,6 +552,7 @@ pub fn read_phase_to_i32(value: ReadPhase) -> i32 {
         ReadPhase::Calvin => 1,
         ReadPhase::SccEffect => 2,
         ReadPhase::SccCondition => 3,
+        ReadPhase::AriaFallback => 4,
     }
 }
 
@@ -498,6 +561,7 @@ pub fn read_phase_from_i32(value: i32) -> Result<ReadPhase> {
         1 => ReadPhase::Calvin,
         2 => ReadPhase::SccEffect,
         3 => ReadPhase::SccCondition,
+        4 => ReadPhase::AriaFallback,
         _ => return Err(Error::InvalidProto(format!("invalid ReadPhase {}", value))),
     })
 }

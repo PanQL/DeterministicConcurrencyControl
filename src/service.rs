@@ -1,10 +1,15 @@
 use crate::convert::{
     batch_from_proto, fs_op_from_proto, inode_entries_to_proto, local_read_status_from_i32,
-    read_entries_from_proto, read_phase_from_i32, scc_reorder_records_to_proto,
-    scheduler_profile_records_to_proto, tx_result_records_to_proto, tx_result_to_i32,
+    read_entries_from_proto, read_entry_to_proto, read_phase_from_i32,
+    scc_reorder_records_to_proto, scheduler_profile_records_to_proto, tx_result_from_i32,
+    tx_result_records_to_proto, tx_result_to_i32, write_entries_from_proto,
 };
-use crate::engine::{ClientTxResult, LocalReadResult, SequencerRuntime, ShardRuntime};
+use crate::engine::{
+    AriaStageOutcome, ClientTxResult, LocalReadResult, SequencerRuntime, ShardRuntime,
+};
+use crate::model::Key;
 use crate::proto::pb;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
@@ -69,6 +74,79 @@ impl pb::shard_server::Shard for ShardService {
             .await
             .map_err(Status::from)?;
         Ok(Response::new(pb::LocalReadResultResponse {}))
+    }
+
+    async fn aria_read_snapshot(
+        &self,
+        request: Request<pb::AriaReadSnapshotRequest>,
+    ) -> std::result::Result<Response<pb::AriaReadSnapshotResponse>, Status> {
+        let request = request.into_inner();
+        let key = Key::new(request.key).map_err(Status::from)?;
+        let value = self
+            .runtime
+            .aria_read_snapshot(
+                request.batch_id,
+                request.tx_index as usize,
+                request.tx_id,
+                request.from_shard,
+                key.clone(),
+            )
+            .await
+            .map_err(Status::from)?;
+        Ok(Response::new(pb::AriaReadSnapshotResponse {
+            read: Some(read_entry_to_proto(&key, &value)),
+        }))
+    }
+
+    async fn aria_stage_outcome(
+        &self,
+        request: Request<pb::AriaStageOutcomeRequest>,
+    ) -> std::result::Result<Response<pb::AriaStageOutcomeResponse>, Status> {
+        let request = request.into_inner();
+        let writes = write_entries_from_proto(request.writes).map_err(Status::from)?;
+        let result = tx_result_from_i32(request.result).map_err(Status::from)?;
+        self.runtime
+            .route_aria_stage_outcome(AriaStageOutcome {
+                batch_id: request.batch_id,
+                tx_index: request.tx_index as usize,
+                tx_id: request.tx_id,
+                from_shard: request.from_shard,
+                result,
+                writes,
+                is_result_shard: request.is_result_shard,
+            })
+            .await
+            .map_err(Status::from)?;
+        Ok(Response::new(pb::AriaStageOutcomeResponse {}))
+    }
+
+    async fn report_aria_execution_done(
+        &self,
+        request: Request<pb::AriaExecutionDoneRequest>,
+    ) -> std::result::Result<Response<pb::AriaExecutionDoneResponse>, Status> {
+        let request = request.into_inner();
+        self.runtime
+            .report_aria_execution_done(request.batch_id, request.from_shard)
+            .await
+            .map_err(Status::from)?;
+        Ok(Response::new(pb::AriaExecutionDoneResponse {}))
+    }
+
+    async fn report_aria_local_failures(
+        &self,
+        request: Request<pb::AriaLocalFailuresRequest>,
+    ) -> std::result::Result<Response<pb::AriaLocalFailuresResponse>, Status> {
+        let request = request.into_inner();
+        let failed_indices: BTreeSet<usize> = request
+            .failed_indices
+            .into_iter()
+            .map(|index| index as usize)
+            .collect();
+        self.runtime
+            .report_aria_local_failures(request.batch_id, request.from_shard, failed_indices)
+            .await
+            .map_err(Status::from)?;
+        Ok(Response::new(pb::AriaLocalFailuresResponse {}))
     }
 
     async fn get_tx_result(

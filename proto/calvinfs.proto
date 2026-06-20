@@ -6,6 +6,10 @@ service Shard {
   rpc Ping(PingRequest) returns (PingResponse);
   rpc ExecuteBatch(ExecuteBatchRequest) returns (ExecuteBatchResponse);
   rpc LocalReadResult(LocalReadResultRequest) returns (LocalReadResultResponse);
+  rpc AriaReadSnapshot(AriaReadSnapshotRequest) returns (AriaReadSnapshotResponse);
+  rpc AriaStageOutcome(AriaStageOutcomeRequest) returns (AriaStageOutcomeResponse);
+  rpc ReportAriaExecutionDone(AriaExecutionDoneRequest) returns (AriaExecutionDoneResponse);
+  rpc ReportAriaLocalFailures(AriaLocalFailuresRequest) returns (AriaLocalFailuresResponse);
   rpc GetTxResult(GetTxResultRequest) returns (GetTxResultResponse);
   rpc DumpState(DumpStateRequest) returns (DumpStateResponse);
 }
@@ -43,6 +47,45 @@ message LocalReadResultRequest {
 }
 
 message LocalReadResultResponse {}
+
+message AriaReadSnapshotRequest {
+  uint64 batch_id = 1;
+  uint32 tx_index = 2;
+  uint64 tx_id = 3;
+  uint64 from_shard = 4;
+  string key = 5;
+}
+
+message AriaReadSnapshotResponse {
+  ReadEntry read = 1;
+}
+
+message AriaStageOutcomeRequest {
+  uint64 batch_id = 1;
+  uint32 tx_index = 2;
+  uint64 tx_id = 3;
+  uint64 from_shard = 4;
+  TxResult result = 5;
+  repeated WriteEntry writes = 6;
+  bool is_result_shard = 7;
+}
+
+message AriaStageOutcomeResponse {}
+
+message AriaExecutionDoneRequest {
+  uint64 batch_id = 1;
+  uint64 from_shard = 2;
+}
+
+message AriaExecutionDoneResponse {}
+
+message AriaLocalFailuresRequest {
+  uint64 batch_id = 1;
+  uint64 from_shard = 2;
+  repeated uint32 failed_indices = 3;
+}
+
+message AriaLocalFailuresResponse {}
 
 message GetTxResultRequest {
   uint64 tx_id = 1;
@@ -132,6 +175,22 @@ message ReadEntry {
 
 message Missing {}
 
+message WriteEntry {
+  oneof op {
+    PutEntry put = 1;
+    DeleteEntry delete = 2;
+  }
+}
+
+message PutEntry {
+  string key = 1;
+  Inode inode = 2;
+}
+
+message DeleteEntry {
+  string key = 1;
+}
+
 enum NodeKind {
   NODE_KIND_UNSPECIFIED = 0;
   NODE_KIND_FILE = 1;
@@ -159,6 +218,7 @@ enum ReadPhase {
   READ_PHASE_CALVIN = 1;
   READ_PHASE_SCC_EFFECT = 2;
   READ_PHASE_SCC_CONDITION = 3;
+  READ_PHASE_ARIA_FALLBACK = 4;
 }
 
 enum LocalReadStatus {
@@ -183,6 +243,7 @@ enum SchedulerProfileScheduler {
   SCHEDULER_PROFILE_SCHEDULER_UNSPECIFIED = 0;
   SCHEDULER_PROFILE_SCHEDULER_CALVIN_LOCKING = 1;
   SCHEDULER_PROFILE_SCHEDULER_SCC_ONLINE = 2;
+  SCHEDULER_PROFILE_SCHEDULER_ARIA = 3;
 }
 
 message WorkerStageStats {

@@ -153,6 +153,7 @@ pub enum ReadPhase {
     Calvin,
     SccEffect,
     SccCondition,
+    AriaFallback,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -189,16 +190,19 @@ pub struct TxResultRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SccReorderRecord {
+pub struct BatchReorderRecord {
     pub batch_id: BatchId,
     pub speculative_success_indices: Vec<usize>,
     pub fallback_indices: Vec<usize>,
 }
 
+pub type SccReorderRecord = BatchReorderRecord;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SchedulerProfileScheduler {
     CalvinLocking,
     SccOnline,
+    Aria,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
