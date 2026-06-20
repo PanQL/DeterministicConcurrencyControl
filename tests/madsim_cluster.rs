@@ -25,7 +25,10 @@ use calvinfs_demo::workload::metadata_workload;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::OsString;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tonic::transport::Server;
@@ -36,6 +39,7 @@ const BATCH_SIZE: usize = 512;
 const MDTEST_DEFAULT_CLIENT_COUNT: usize = 8;
 const MDTEST_DEFAULT_DIRS_PER_CLIENT: usize = 4;
 const MDTEST_DEFAULT_FILES_PER_CLIENT: usize = 64;
+const MDTEST_DEFAULT_RESULT_INFLIGHT: usize = 64;
 const MDTEST_PRIVATE_ROOT: &str = "/mdtest_private";
 const MDTEST_PUBLIC_ROOT: &str = "/mdtest_public";
 const MDWB_DEFAULT_CLIENT_COUNT: usize = 8;
@@ -252,8 +256,13 @@ async fn scheduler_profiles_dump_state() -> Result<()> {
 async fn mdtest_like_client_workload() -> Result<()> {
     let config = MdtestConfig::from_env()?;
     println!(
-        "\nCalvinFS mdtest-like workload: clients={} dirs/client={} files/client={} batch_size={}",
-        config.client_count, config.dirs_per_client, config.files_per_client, config.batch_size
+        "\nCalvinFS mdtest-like workload: clients={} dirs/client={} files/client={} batch_size={} result_inflight={} result_channel_capacity={}",
+        config.client_count,
+        config.dirs_per_client,
+        config.files_per_client,
+        config.batch_size,
+        config.result_inflight,
+        config.result_channel_capacity
     );
 
     let calvin_private_summary =
@@ -321,6 +330,28 @@ async fn mdtest_like_client_workload() -> Result<()> {
         &scc_public_summary,
         &aria_public_summary,
     );
+    write_mdtest_csv_if_requested(
+        &[
+            &calvin_private_summary,
+            &calvin_public_summary,
+            &scc_private_summary,
+            &scc_public_summary,
+            &aria_private_summary,
+            &aria_public_summary,
+        ],
+        &config,
+    )?;
+    write_mdtest_latency_csv_if_requested(
+        &[
+            &calvin_private_summary,
+            &calvin_public_summary,
+            &scc_private_summary,
+            &scc_public_summary,
+            &aria_private_summary,
+            &aria_public_summary,
+        ],
+        &config,
+    )?;
 
     Ok(())
 }
@@ -367,6 +398,7 @@ async fn md_workbench_like_client_workload() -> Result<()> {
         print_mdwb_summary(summary, config.show_ranks);
     }
     print_mdwb_scheduler_comparison(&summaries)?;
+    write_mdwb_csv_if_requested(&summaries, &config)?;
 
     Ok(())
 }
@@ -1250,12 +1282,22 @@ struct MdtestConfig {
     dirs_per_client: usize,
     files_per_client: usize,
     batch_size: usize,
+    result_inflight: usize,
+    result_channel_capacity: usize,
     show_ranks: bool,
     scheduler_profile: bool,
 }
 
 impl MdtestConfig {
     fn from_env() -> Result<Self> {
+        let result_inflight = read_positive_usize_env(
+            "CALVINFS_MDTEST_RESULT_INFLIGHT",
+            MDTEST_DEFAULT_RESULT_INFLIGHT,
+        )?;
+        let result_channel_capacity = read_positive_usize_env(
+            "CALVINFS_MDTEST_RESULT_CHANNEL_CAPACITY",
+            result_inflight.saturating_mul(2),
+        )?;
         Ok(Self {
             client_count: read_positive_usize_env(
                 "CALVINFS_MDTEST_CLIENTS",
@@ -1270,6 +1312,8 @@ impl MdtestConfig {
                 MDTEST_DEFAULT_FILES_PER_CLIENT,
             )?,
             batch_size: read_positive_usize_env("CALVINFS_MDTEST_BATCH_SIZE", BATCH_SIZE)?,
+            result_inflight,
+            result_channel_capacity,
             show_ranks: read_bool_env("CALVINFS_MDTEST_SHOW_RANKS", false)?,
             scheduler_profile: read_bool_env("CALVINFS_SCHED_PROFILE", false)?,
         })
@@ -1362,8 +1406,11 @@ impl MdtestPhase {
 struct SubmittedClientTx {
     label: String,
     expected: TxResult,
+    op_index: usize,
     tx_id: u64,
     result_shard: ShardId,
+    submit_start: Duration,
+    submit_ack: Duration,
 }
 
 #[derive(Clone, Debug)]
@@ -1372,6 +1419,18 @@ struct RankPhaseResult {
     items: usize,
     time_before_barrier: Duration,
     time: Duration,
+    latencies: Vec<TxLatencySample>,
+}
+
+#[derive(Clone, Debug)]
+struct TxLatencySample {
+    rank: usize,
+    item: usize,
+    tx_id: u64,
+    result_shard: ShardId,
+    submit_start: Duration,
+    submit_ack: Duration,
+    complete: Duration,
 }
 
 #[derive(Clone, Debug)]
@@ -1428,21 +1487,18 @@ impl Drop for EnvVarGuard {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MdwbScenario {
-    PrivateOffset { offset: usize },
     ParentBuckets { parent_count: usize },
 }
 
 impl MdwbScenario {
     fn name(&self) -> String {
         match self {
-            Self::PrivateOffset { offset } => format!("private_offset_{offset}"),
             Self::ParentBuckets { parent_count } => format!("parent_buckets_{parent_count}"),
         }
     }
 
     fn mode_name(&self) -> &'static str {
         match self {
-            Self::PrivateOffset { .. } => "offset-scan",
             Self::ParentBuckets { .. } => "bucket-hotness",
         }
     }
@@ -1460,7 +1516,7 @@ struct MdwbConfig {
     ops_per_set: usize,
     iterations: usize,
     batch_size: usize,
-    private_offsets: Vec<usize>,
+    offset: usize,
     parent_buckets: Vec<usize>,
     show_ranks: bool,
     scheduler_profile: bool,
@@ -1482,9 +1538,7 @@ impl MdwbConfig {
             read_positive_usize_env("CALVINFS_MDWB_ITERATIONS", MDWB_DEFAULT_ITERATIONS)?;
         let batch_size = read_positive_usize_env("CALVINFS_MDWB_BATCH_SIZE", BATCH_SIZE)?;
 
-        let default_offsets = if client_count > 1 { vec![1] } else { vec![0] };
-        let private_offsets =
-            read_usize_list_env("CALVINFS_MDWB_PRIVATE_OFFSETS", &default_offsets, true)?;
+        let offset = read_usize_env("CALVINFS_MDWB_OFFSET", if client_count > 1 { 1 } else { 0 })?;
         let default_parent_buckets = default_mdwb_parent_buckets(client_count);
         let parent_buckets = read_usize_list_env(
             "CALVINFS_MDWB_PARENT_BUCKETS",
@@ -1499,7 +1553,7 @@ impl MdwbConfig {
             ops_per_set,
             iterations,
             batch_size,
-            private_offsets,
+            offset,
             parent_buckets,
             show_ranks: read_bool_env("CALVINFS_MDWB_SHOW_RANKS", false)?,
             scheduler_profile: read_bool_env("CALVINFS_SCHED_PROFILE", false)?,
@@ -1518,14 +1572,12 @@ impl MdwbConfig {
                 "CALVINFS_MDWB_OPS_PER_SET * CALVINFS_MDWB_ITERATIONS must be <= CALVINFS_MDWB_PRECREATE_PER_SET"
             );
         }
-        for offset in self.private_offsets.iter().copied() {
-            if offset >= self.client_count {
-                bail!(
-                    "CALVINFS_MDWB_PRIVATE_OFFSETS entries must be < CALVINFS_MDWB_CLIENTS; got offset={} clients={}",
-                    offset,
-                    self.client_count
-                );
-            }
+        if self.offset >= self.client_count {
+            bail!(
+                "CALVINFS_MDWB_OFFSET must be < CALVINFS_MDWB_CLIENTS; got offset={} clients={}",
+                self.offset,
+                self.client_count
+            );
         }
         for parent_count in self.parent_buckets.iter().copied() {
             if parent_count > self.client_count {
@@ -1540,11 +1592,7 @@ impl MdwbConfig {
     }
 
     fn scenarios(&self) -> Vec<MdwbScenario> {
-        let mut scenarios =
-            Vec::with_capacity(self.private_offsets.len() + self.parent_buckets.len());
-        for offset in self.private_offsets.iter().copied() {
-            scenarios.push(MdwbScenario::PrivateOffset { offset });
-        }
+        let mut scenarios = Vec::with_capacity(self.parent_buckets.len());
         for parent_count in self.parent_buckets.iter().copied() {
             scenarios.push(MdwbScenario::ParentBuckets { parent_count });
         }
@@ -1792,7 +1840,7 @@ async fn run_mdwb_client_driver(
 
     let mut sequencer =
         pb::sequencer_client::SequencerClient::connect(sequencer_endpoint.clone()).await?;
-    setup_mdwb_scenario(&mut sequencer, &shard_endpoints, scenario, &config).await?;
+    setup_mdwb_scenario(&mut sequencer, &shard_endpoints, scenario).await?;
 
     let conflict = MdwbConflictSummary::new(scenario, &config)?;
     let mut seen_profile_keys = BTreeSet::new();
@@ -1849,7 +1897,7 @@ async fn run_mdwb_client_driver(
     };
     phases.push(MdwbPhaseSummary::new(MdwbPhase::Cleanup, ranks, profiles));
 
-    cleanup_mdwb_scenario_dirs(&mut sequencer, &shard_endpoints, scenario, &config).await?;
+    cleanup_mdwb_scenario_dirs(&mut sequencer, &shard_endpoints, scenario).await?;
     submit_client_tx(
         &mut sequencer,
         &shard_endpoints,
@@ -1872,7 +1920,6 @@ async fn setup_mdwb_scenario(
     sequencer: &mut pb::sequencer_client::SequencerClient<tonic::transport::Channel>,
     shard_endpoints: &BTreeMap<ShardId, String>,
     scenario: MdwbScenario,
-    config: &MdwbConfig,
 ) -> Result<()> {
     submit_client_tx(
         sequencer,
@@ -1900,31 +1947,6 @@ async fn setup_mdwb_scenario(
     .await?;
 
     match scenario {
-        MdwbScenario::PrivateOffset { .. } => {
-            for rank in 0..config.client_count {
-                submit_client_tx(
-                    sequencer,
-                    shard_endpoints,
-                    &format!("mdwb:{}:setup:mkdir_rank_{rank}", scenario.name()),
-                    mkdir(&mdwb_private_rank_root(scenario, rank))?,
-                    TxResult::Ok,
-                )
-                .await?;
-                for data_set in 0..config.data_set_count {
-                    submit_client_tx(
-                        sequencer,
-                        shard_endpoints,
-                        &format!(
-                            "mdwb:{}:setup:mkdir_rank_{rank}_set_{data_set}",
-                            scenario.name()
-                        ),
-                        mkdir(&mdwb_private_parent(scenario, rank, data_set))?,
-                        TxResult::Ok,
-                    )
-                    .await?;
-                }
-            }
-        }
         MdwbScenario::ParentBuckets { parent_count } => {
             for bucket in 0..parent_count {
                 submit_client_tx(
@@ -1945,34 +1967,8 @@ async fn cleanup_mdwb_scenario_dirs(
     sequencer: &mut pb::sequencer_client::SequencerClient<tonic::transport::Channel>,
     shard_endpoints: &BTreeMap<ShardId, String>,
     scenario: MdwbScenario,
-    config: &MdwbConfig,
 ) -> Result<()> {
     match scenario {
-        MdwbScenario::PrivateOffset { .. } => {
-            for rank in 0..config.client_count {
-                for data_set in 0..config.data_set_count {
-                    submit_client_tx(
-                        sequencer,
-                        shard_endpoints,
-                        &format!(
-                            "mdwb:{}:cleanup:rmdir_rank_{rank}_set_{data_set}",
-                            scenario.name()
-                        ),
-                        rmdir(&mdwb_private_parent(scenario, rank, data_set))?,
-                        TxResult::Ok,
-                    )
-                    .await?;
-                }
-                submit_client_tx(
-                    sequencer,
-                    shard_endpoints,
-                    &format!("mdwb:{}:cleanup:rmdir_rank_{rank}", scenario.name()),
-                    rmdir(&mdwb_private_rank_root(scenario, rank))?,
-                    TxResult::Ok,
-                )
-                .await?;
-            }
-        }
         MdwbScenario::ParentBuckets { parent_count } => {
             for bucket in 0..parent_count {
                 submit_client_tx(
@@ -2083,17 +2079,22 @@ async fn run_mdwb_rank_phase(input: MdwbRankPhaseInput) -> Result<RankPhaseResul
             scenario.name(),
             phase.name()
         );
+        let submit_start = started.elapsed();
         let response = sequencer
             .submit_tx(pb::SubmitTxRequest {
                 op: Some(fs_op_to_proto(&op)),
             })
             .await?
             .into_inner();
+        let submit_ack = started.elapsed();
         submitted.push(SubmittedClientTx {
             label,
             expected: TxResult::Ok,
+            op_index,
             tx_id: response.tx_id,
             result_shard: response.result_shard,
+            submit_start,
+            submit_ack,
         });
     }
 
@@ -2117,6 +2118,7 @@ async fn run_mdwb_rank_phase(input: MdwbRankPhaseInput) -> Result<RankPhaseResul
         items: submitted.len(),
         time_before_barrier,
         time,
+        latencies: Vec::new(),
     })
 }
 
@@ -2200,12 +2202,10 @@ fn mdwb_benchmark_read_object_path(
     file_index: usize,
 ) -> String {
     match scenario {
-        MdwbScenario::PrivateOffset { offset } => {
-            let target_rank = mdwb_offset_rank(rank, offset, data_set, config.client_count, false);
-            mdwb_private_object_path(scenario, target_rank, data_set, file_index)
-        }
         MdwbScenario::ParentBuckets { .. } => {
-            mdwb_bucket_object_path(scenario, rank, data_set, file_index)
+            let target_rank =
+                mdwb_offset_rank(rank, config.offset, data_set, config.client_count, false);
+            mdwb_bucket_object_path(scenario, target_rank, data_set, file_index)
         }
     }
 }
@@ -2218,12 +2218,10 @@ fn mdwb_benchmark_write_object_path(
     file_index: usize,
 ) -> String {
     match scenario {
-        MdwbScenario::PrivateOffset { offset } => {
-            let target_rank = mdwb_offset_rank(rank, offset, data_set, config.client_count, true);
-            mdwb_private_object_path(scenario, target_rank, data_set, file_index)
-        }
         MdwbScenario::ParentBuckets { .. } => {
-            mdwb_bucket_object_path(scenario, rank, data_set, file_index)
+            let target_rank =
+                mdwb_offset_rank(rank, config.offset, data_set, config.client_count, true);
+            mdwb_bucket_object_path(scenario, target_rank, data_set, file_index)
         }
     }
 }
@@ -2235,9 +2233,6 @@ fn mdwb_owner_object_path(
     file_index: usize,
 ) -> String {
     match scenario {
-        MdwbScenario::PrivateOffset { .. } => {
-            mdwb_private_object_path(scenario, rank, data_set, file_index)
-        }
         MdwbScenario::ParentBuckets { .. } => {
             mdwb_bucket_object_path(scenario, rank, data_set, file_index)
         }
@@ -2259,26 +2254,6 @@ fn mdwb_offset_rank(
     }
 }
 
-fn mdwb_private_rank_root(scenario: MdwbScenario, rank: usize) -> String {
-    format!("{}/rank_{rank}", scenario.root())
-}
-
-fn mdwb_private_parent(scenario: MdwbScenario, rank: usize, data_set: usize) -> String {
-    format!("{}/set_{data_set}", mdwb_private_rank_root(scenario, rank))
-}
-
-fn mdwb_private_object_path(
-    scenario: MdwbScenario,
-    rank: usize,
-    data_set: usize,
-    file_index: usize,
-) -> String {
-    format!(
-        "{}/file_{file_index}",
-        mdwb_private_parent(scenario, rank, data_set)
-    )
-}
-
 fn mdwb_bucket_parent(scenario: MdwbScenario, bucket: usize) -> String {
     format!("{}/bucket_{bucket}", scenario.root())
 }
@@ -2289,9 +2264,7 @@ fn mdwb_bucket_object_path(
     data_set: usize,
     file_index: usize,
 ) -> String {
-    let MdwbScenario::ParentBuckets { parent_count } = scenario else {
-        unreachable!("bucket object path is only valid for parent-bucket scenarios");
-    };
+    let MdwbScenario::ParentBuckets { parent_count } = scenario;
     let bucket = rank % parent_count;
     format!(
         "{}/rank_{rank}_set_{data_set}_file_{file_index}",
@@ -2432,42 +2405,53 @@ async fn run_mdtest_rank_phase(input: MdtestRankPhaseInput) -> Result<RankPhaseR
 
     let ops = phase.operations_for_rank(mode, &config, rank)?;
     let mut sequencer = pb::sequencer_client::SequencerClient::connect(sequencer_endpoint).await?;
-    let mut shard_clients = connect_shard_clients(&shard_endpoints).await?;
+    let shard_clients = connect_shard_clients(&shard_endpoints).await?;
 
     start_barrier.wait().await;
     let started = Instant::now();
 
-    let mut submitted = Vec::with_capacity(ops.len());
+    let op_count = ops.len();
+    let (result_tx, result_rx) = tokio::sync::mpsc::channel(config.result_channel_capacity);
+    let collector = tokio::spawn(run_mdtest_result_collector(
+        rank,
+        started,
+        shard_clients,
+        result_rx,
+        config.result_inflight,
+    ));
+
     for (op_index, op) in ops.into_iter().enumerate() {
         let label = format!(
             "mdtest:{}:{}:rank_{rank}:op_{op_index}",
             mode.name(),
             phase.name()
         );
+        let submit_start = started.elapsed();
         let response = sequencer
             .submit_tx(pb::SubmitTxRequest {
                 op: Some(fs_op_to_proto(&op)),
             })
             .await?
             .into_inner();
-        submitted.push(SubmittedClientTx {
+        let submit_ack = started.elapsed();
+        let submitted = SubmittedClientTx {
             label,
             expected: TxResult::Ok,
+            op_index,
             tx_id: response.tx_id,
             result_shard: response.result_shard,
-        });
+            submit_start,
+            submit_ack,
+        };
+        if result_tx.send(submitted).await.is_err() {
+            bail!("mdtest result collector stopped for rank {rank}");
+        }
     }
+    drop(result_tx);
 
-    for tx in &submitted {
-        let shard = shard_clients
-            .get_mut(&tx.result_shard)
-            .expect("result shard client should be connected");
-        let result = shard
-            .get_tx_result(pb::GetTxResultRequest { tx_id: tx.tx_id })
-            .await?
-            .into_inner();
-        assert_ready_result(&tx.label, &result, tx.expected)?;
-    }
+    let latencies = collector
+        .await
+        .expect("mdtest result collector task panicked")?;
 
     let time_before_barrier = started.elapsed();
     end_barrier.wait().await;
@@ -2475,10 +2459,97 @@ async fn run_mdtest_rank_phase(input: MdtestRankPhaseInput) -> Result<RankPhaseR
 
     Ok(RankPhaseResult {
         rank,
-        items: submitted.len(),
+        items: op_count,
         time_before_barrier,
         time,
+        latencies,
     })
+}
+
+async fn run_mdtest_result_collector(
+    rank: usize,
+    started: Instant,
+    mut shard_clients: BTreeMap<ShardId, pb::shard_client::ShardClient<tonic::transport::Channel>>,
+    mut result_rx: tokio::sync::mpsc::Receiver<SubmittedClientTx>,
+    result_inflight: usize,
+) -> Result<Vec<TxLatencySample>> {
+    let (done_tx, mut done_rx) = tokio::sync::mpsc::channel(result_inflight);
+    let mut latencies = Vec::new();
+    let mut active = 0usize;
+    let mut input_closed = false;
+
+    loop {
+        while active < result_inflight && !input_closed {
+            match result_rx.recv().await {
+                Some(tx) => {
+                    spawn_mdtest_result_waiter(
+                        rank,
+                        started,
+                        &mut shard_clients,
+                        tx,
+                        done_tx.clone(),
+                    )?;
+                    active += 1;
+                }
+                None => {
+                    input_closed = true;
+                }
+            }
+        }
+
+        if active == 0 {
+            if input_closed {
+                break;
+            }
+            continue;
+        }
+
+        let sample = done_rx
+            .recv()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("mdtest result waiter channel closed"))??;
+        active -= 1;
+        latencies.push(sample);
+    }
+
+    latencies.sort_by_key(|sample| sample.item);
+    Ok(latencies)
+}
+
+fn spawn_mdtest_result_waiter(
+    rank: usize,
+    started: Instant,
+    shard_clients: &mut BTreeMap<ShardId, pb::shard_client::ShardClient<tonic::transport::Channel>>,
+    tx: SubmittedClientTx,
+    done_tx: tokio::sync::mpsc::Sender<Result<TxLatencySample>>,
+) -> Result<()> {
+    let Some(mut shard) = shard_clients.get(&tx.result_shard).cloned() else {
+        bail!(
+            "result shard client {} should be connected",
+            tx.result_shard
+        );
+    };
+    tokio::spawn(async move {
+        let sample = async {
+            let result = shard
+                .get_tx_result(pb::GetTxResultRequest { tx_id: tx.tx_id })
+                .await?
+                .into_inner();
+            assert_ready_result(&tx.label, &result, tx.expected)?;
+            Ok(TxLatencySample {
+                rank,
+                item: tx.op_index,
+                tx_id: tx.tx_id,
+                result_shard: tx.result_shard,
+                submit_start: tx.submit_start,
+                submit_ack: tx.submit_ack,
+                complete: started.elapsed(),
+            })
+        }
+        .await;
+        let _ = done_tx.send(sample).await;
+    });
+    Ok(())
 }
 
 async fn setup_mdtest_mode(
@@ -2640,8 +2711,11 @@ async fn submit_client_tx(
     Ok(SubmittedClientTx {
         label: label.to_string(),
         expected,
+        op_index: 0,
         tx_id: response.tx_id,
         result_shard: response.result_shard,
+        submit_start: Duration::ZERO,
+        submit_ack: Duration::ZERO,
     })
 }
 
@@ -3330,6 +3404,334 @@ fn mdwb_benchmark_ops_per_sec(summary: &MdwbSummary) -> f64 {
     }
 }
 
+fn write_mdtest_csv_if_requested(summaries: &[&ModeSummary], config: &MdtestConfig) -> Result<()> {
+    let Some(path) = bench_output_path() else {
+        return Ok(());
+    };
+    let mut rows = Vec::new();
+    for summary in summaries {
+        for phase in &summary.phases {
+            rows.push(vec![
+                bench_source(),
+                "mdtest".to_string(),
+                summary.mode.name().to_string(),
+                summary.scheduler.name().to_string(),
+                bench_trial(),
+                config.client_count.to_string(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                config.batch_size.to_string(),
+                String::new(),
+                String::new(),
+                String::new(),
+                mdtest_phase_operation(phase.phase).to_string(),
+                phase.phase.name().to_string(),
+                phase_total_items(&phase.ranks).to_string(),
+                format!("{:.9}", phase_aggregate_seconds(&phase.ranks)),
+                format!("{:.9}", phase.aggregate_ops_per_sec),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                sum_profile_counter(&phase.profiles, |profile| {
+                    profile.counters.local_failed_count
+                })
+                .to_string(),
+                sum_profile_counter(&phase.profiles, |profile| {
+                    profile.counters.global_failed_count
+                })
+                .to_string(),
+                sum_profile_counter(&phase.profiles, |profile| {
+                    profile.counters.fallback_tx_count
+                })
+                .to_string(),
+                bench_git_rev(),
+            ]);
+        }
+    }
+    append_bench_csv_rows(&path, &rows)
+}
+
+fn write_mdtest_latency_csv_if_requested(
+    summaries: &[&ModeSummary],
+    config: &MdtestConfig,
+) -> Result<()> {
+    let Some(path) = latency_output_path() else {
+        return Ok(());
+    };
+    let mut rows = Vec::new();
+    for summary in summaries {
+        for phase in &summary.phases {
+            for rank in &phase.ranks {
+                for sample in &rank.latencies {
+                    rows.push(vec![
+                        bench_source(),
+                        "mdtest".to_string(),
+                        summary.mode.name().to_string(),
+                        summary.scheduler.name().to_string(),
+                        bench_trial(),
+                        config.client_count.to_string(),
+                        config.batch_size.to_string(),
+                        config.result_inflight.to_string(),
+                        config.result_channel_capacity.to_string(),
+                        mdtest_phase_operation(phase.phase).to_string(),
+                        phase.phase.name().to_string(),
+                        sample.rank.to_string(),
+                        sample.item.to_string(),
+                        sample.tx_id.to_string(),
+                        sample.result_shard.to_string(),
+                        format!("{:.9}", duration_ms(sample.submit_start)),
+                        format!("{:.9}", duration_ms(sample.submit_ack)),
+                        format!("{:.9}", duration_ms(sample.complete)),
+                        format!(
+                            "{:.9}",
+                            duration_ms(sample.complete.saturating_sub(sample.submit_start))
+                        ),
+                        "ok".to_string(),
+                        bench_git_rev(),
+                    ]);
+                }
+            }
+        }
+    }
+    append_latency_csv_rows(&path, &rows)
+}
+
+fn write_mdwb_csv_if_requested(summaries: &[MdwbSummary], config: &MdwbConfig) -> Result<()> {
+    let Some(path) = bench_output_path() else {
+        return Ok(());
+    };
+    let mut rows = Vec::new();
+    for summary in summaries {
+        let tx_count = summary.conflict.benchmark_tx_count;
+        let conflicts = summary.conflict.cross_rank_key_conflicts;
+        let conflicts_per_tx = if tx_count == 0 {
+            0.0
+        } else {
+            conflicts as f64 / tx_count as f64
+        };
+        let (offset, parent_count, fan_in) = mdwb_scenario_csv_dimensions(summary.scenario, config);
+        let benchmark_profiles: Vec<SchedulerProfileRecord> = summary
+            .phases
+            .iter()
+            .filter(|phase| phase.phase.is_benchmark())
+            .flat_map(|phase| phase.profiles.iter().cloned())
+            .collect();
+        rows.push(vec![
+            bench_source(),
+            "mdworkbench".to_string(),
+            summary.scenario.mode_name().to_string(),
+            summary.scheduler.name().to_string(),
+            bench_trial(),
+            config.client_count.to_string(),
+            config.data_set_count.to_string(),
+            config.precreate_per_set.to_string(),
+            config.ops_per_set.to_string(),
+            config.iterations.to_string(),
+            config.batch_size.to_string(),
+            offset.map(|value| value.to_string()).unwrap_or_default(),
+            parent_count.to_string(),
+            format!("{fan_in:.9}"),
+            "benchmark".to_string(),
+            "benchmark_total".to_string(),
+            tx_count.to_string(),
+            format!("{:.9}", mdwb_benchmark_seconds(summary)),
+            format!("{:.9}", mdwb_benchmark_ops_per_sec(summary)),
+            conflicts.to_string(),
+            format!("{conflicts_per_tx:.9}"),
+            summary.conflict.parent_write_parent_count.to_string(),
+            summary.conflict.max_clients_per_parent.to_string(),
+            format!("{:.9}", summary.conflict.mean_clients_per_parent),
+            sum_profile_counter(&benchmark_profiles, |profile| {
+                profile.counters.local_failed_count
+            })
+            .to_string(),
+            sum_profile_counter(&benchmark_profiles, |profile| {
+                profile.counters.global_failed_count
+            })
+            .to_string(),
+            sum_profile_counter(&benchmark_profiles, |profile| {
+                profile.counters.fallback_tx_count
+            })
+            .to_string(),
+            bench_git_rev(),
+        ]);
+    }
+    append_bench_csv_rows(&path, &rows)
+}
+
+fn mdtest_phase_operation(phase: MdtestPhase) -> &'static str {
+    match phase {
+        MdtestPhase::DirectoryCreation => "directory_create",
+        MdtestPhase::DirectoryStat => "directory_stat",
+        MdtestPhase::FileCreation => "file_create",
+        MdtestPhase::FileStat => "file_stat",
+        MdtestPhase::FileRemoval => "file_unlink",
+        MdtestPhase::DirectoryRemoval => "directory_remove",
+    }
+}
+
+fn mdwb_scenario_csv_dimensions(
+    scenario: MdwbScenario,
+    config: &MdwbConfig,
+) -> (Option<usize>, usize, f64) {
+    match scenario {
+        MdwbScenario::ParentBuckets { parent_count } => (
+            Some(config.offset),
+            parent_count,
+            config.client_count as f64 / parent_count as f64,
+        ),
+    }
+}
+
+fn mdwb_benchmark_seconds(summary: &MdwbSummary) -> f64 {
+    summary
+        .phases
+        .iter()
+        .filter(|phase| phase.phase.is_benchmark())
+        .map(|phase| phase.aggregate_seconds)
+        .sum()
+}
+
+fn phase_total_items(ranks: &[RankPhaseResult]) -> usize {
+    ranks.iter().map(|rank| rank.items).sum()
+}
+
+fn phase_aggregate_seconds(ranks: &[RankPhaseResult]) -> f64 {
+    ranks
+        .iter()
+        .map(|rank| rank.time.as_secs_f64())
+        .fold(0.0, f64::max)
+}
+
+fn bench_output_path() -> Option<PathBuf> {
+    env::var_os("CALVINFS_BENCH_OUTPUT").map(PathBuf::from)
+}
+
+fn latency_output_path() -> Option<PathBuf> {
+    env::var_os("CALVINFS_BENCH_LATENCY_OUTPUT").map(PathBuf::from)
+}
+
+fn bench_source() -> String {
+    env::var("CALVINFS_BENCH_SOURCE").unwrap_or_else(|_| "madsim".to_string())
+}
+
+fn bench_trial() -> String {
+    env::var("CALVINFS_BENCH_TRIAL").unwrap_or_else(|_| "0".to_string())
+}
+
+fn bench_git_rev() -> String {
+    env::var("CALVINFS_BENCH_GIT_REV").unwrap_or_else(|_| "unknown".to_string())
+}
+
+fn append_bench_csv_rows(path: &Path, rows: &[Vec<String>]) -> Result<()> {
+    append_csv_rows(path, BENCH_CSV_HEADER, rows)
+}
+
+fn append_latency_csv_rows(path: &Path, rows: &[Vec<String>]) -> Result<()> {
+    append_csv_rows(path, LATENCY_CSV_HEADER, rows)
+}
+
+fn append_csv_rows(path: &Path, header: &[&str], rows: &[Vec<String>]) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let needs_header = match fs::metadata(path) {
+        Ok(metadata) => metadata.len() == 0,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+        Err(err) => return Err(err.into()),
+    };
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    if needs_header {
+        file.write_all(csv_line(header).as_bytes())?;
+    }
+    for row in rows {
+        file.write_all(csv_line(row).as_bytes())?;
+    }
+    Ok(())
+}
+
+const BENCH_CSV_HEADER: &[&str] = &[
+    "source",
+    "workload",
+    "mode",
+    "scheduler",
+    "trial",
+    "clients",
+    "data_sets",
+    "precreate_per_set",
+    "ops_per_set",
+    "iterations",
+    "batch_size",
+    "offset",
+    "parent_count",
+    "fan_in",
+    "operation",
+    "phase",
+    "tx_count",
+    "seconds",
+    "ops_per_sec",
+    "key_conflicts",
+    "conflicts_per_tx",
+    "parent_write_parent_count",
+    "max_clients_per_parent",
+    "mean_clients_per_parent",
+    "local_failed_count",
+    "global_failed_count",
+    "fallback_tx_count",
+    "git_rev",
+];
+
+const LATENCY_CSV_HEADER: &[&str] = &[
+    "source",
+    "workload",
+    "mode",
+    "scheduler",
+    "trial",
+    "clients",
+    "batch_size",
+    "result_inflight",
+    "result_channel_capacity",
+    "operation",
+    "phase",
+    "rank",
+    "item",
+    "tx_id",
+    "result_shard",
+    "submit_start_ms",
+    "submit_ack_ms",
+    "complete_ms",
+    "latency_ms",
+    "status",
+    "git_rev",
+];
+
+fn csv_line(fields: &[impl AsRef<str>]) -> String {
+    let mut line = fields
+        .iter()
+        .map(|field| csv_escape(field.as_ref()))
+        .collect::<Vec<_>>()
+        .join(",");
+    line.push('\n');
+    line
+}
+
+fn csv_escape(value: &str) -> String {
+    if value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r') {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
 fn read_positive_usize_env(name: &str, default: usize) -> Result<usize> {
     let Some(value) = env::var_os(name) else {
         return Ok(default);
@@ -3342,6 +3744,16 @@ fn read_positive_usize_env(name: &str, default: usize) -> Result<usize> {
         bail!("{name} must be greater than zero");
     }
     Ok(parsed)
+}
+
+fn read_usize_env(name: &str, default: usize) -> Result<usize> {
+    let Some(value) = env::var_os(name) else {
+        return Ok(default);
+    };
+    value
+        .to_string_lossy()
+        .parse::<usize>()
+        .map_err(|err| anyhow::anyhow!("{name} must be an integer: {err}"))
 }
 
 fn read_usize_list_env(name: &str, default: &[usize], allow_zero: bool) -> Result<Vec<usize>> {
@@ -3435,6 +3847,10 @@ fn ms_per_op(items: usize, duration: Duration) -> f64 {
     } else {
         seconds * 1000.0 / items as f64
     }
+}
+
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
 }
 
 fn private_client_root(rank: usize) -> String {
