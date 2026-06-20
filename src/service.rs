@@ -3,9 +3,7 @@ use crate::convert::{
     read_entries_from_proto, read_phase_from_i32, scc_reorder_records_to_proto,
     scheduler_profile_records_to_proto, tx_result_records_to_proto, tx_result_to_i32,
 };
-use crate::engine::{
-    ClientTxResult, LocalReadResult, SccCompletionReport, SequencerRuntime, ShardRuntime,
-};
+use crate::engine::{ClientTxResult, LocalReadResult, SequencerRuntime, ShardRuntime};
 use crate::proto::pb;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
@@ -71,26 +69,6 @@ impl pb::shard_server::Shard for ShardService {
             .await
             .map_err(Status::from)?;
         Ok(Response::new(pb::LocalReadResultResponse {}))
-    }
-
-    async fn report_scc_completion(
-        &self,
-        request: Request<pb::SccCompletionReportRequest>,
-    ) -> std::result::Result<Response<pb::SccCompletionReportResponse>, Status> {
-        let request = request.into_inner();
-        self.runtime
-            .route_scc_completion_report(SccCompletionReport {
-                batch_id: request.batch_id,
-                from_shard: request.from_shard,
-                failed_tx_indices: request
-                    .failed_tx_indices
-                    .into_iter()
-                    .map(|index| index as usize)
-                    .collect(),
-            })
-            .await
-            .map_err(Status::from)?;
-        Ok(Response::new(pb::SccCompletionReportResponse {}))
     }
 
     async fn get_tx_result(

@@ -352,7 +352,55 @@ async fn run_scc_prediction_failure_driver(
     }
 
     let layout = ShardLayout::new(SHARD_COUNT);
-    let scc_reorders = assert_scc_reorders_consistent(shard_reorders)?;
+    let failed_tx_participants = layout
+        .participants(&reference_batches.last().unwrap().txs[1])
+        .all;
+    let mut participant_fallbacks = BTreeSet::new();
+    let mut non_participant_no_fallbacks = BTreeSet::new();
+    for (shard_id, records) in &shard_reorders {
+        let local_reorder = records
+            .iter()
+            .find(|record| record.batch_id == fallback_batch_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "shard {} missing SCC fallback reorder record for batch {}",
+                    shard_id,
+                    fallback_batch_id
+                )
+            })?;
+        let has_failed_tx_fallback = local_reorder.fallback_indices.contains(&1);
+        if failed_tx_participants.contains(shard_id) {
+            if !has_failed_tx_fallback {
+                bail!(
+                    "participating shard {} should fallback failed tx locally, got {:?}",
+                    shard_id,
+                    local_reorder
+                );
+            }
+            participant_fallbacks.insert(*shard_id);
+        } else {
+            if has_failed_tx_fallback {
+                bail!(
+                    "non-participant shard {} should keep failed tx as local NoOp, got {:?}",
+                    shard_id,
+                    local_reorder
+                );
+            }
+            non_participant_no_fallbacks.insert(*shard_id);
+        }
+    }
+    if participant_fallbacks != failed_tx_participants {
+        bail!(
+            "expected local fallback on participating shards {:?}, got {:?}",
+            failed_tx_participants,
+            participant_fallbacks
+        );
+    }
+    if non_participant_no_fallbacks.is_empty() {
+        bail!("prediction failure scenario did not include a non-participant shard");
+    }
+
+    let scc_reorders = assert_scc_reorders_consistent(&reference_batches, shard_reorders)?;
     let fallback_reorder = scc_reorders
         .get(&fallback_batch_id)
         .ok_or_else(|| anyhow::anyhow!("missing SCC fallback reorder record"))?;
@@ -435,7 +483,7 @@ async fn run_scc_same_parent_create_driver(
     }
 
     let layout = ShardLayout::new(SHARD_COUNT);
-    let scc_reorders = assert_scc_reorders_consistent(shard_reorders)?;
+    let scc_reorders = assert_scc_reorders_consistent(&reference_batches, shard_reorders)?;
     if scc_reorders
         .values()
         .any(|record| !record.fallback_indices.is_empty())
@@ -568,7 +616,7 @@ async fn run_scc_mixed_metadata_driver(
     }
 
     let layout = ShardLayout::new(SHARD_COUNT);
-    let scc_reorders = assert_scc_reorders_consistent(shard_reorders)?;
+    let scc_reorders = assert_scc_reorders_consistent(&reference_batches, shard_reorders)?;
     if scc_reorders
         .values()
         .any(|record| !record.fallback_indices.is_empty())
@@ -1901,14 +1949,6 @@ fn top_profile_stages(profiles: &[SchedulerProfileRecord]) -> String {
         (
             "commit",
             sum_profile_stage(profiles, |p| p.timings.scc_commit.sum_ns),
-        ),
-        (
-            "completion_pub",
-            sum_profile_stage(profiles, |p| p.timings.completion_publish_ns),
-        ),
-        (
-            "completion_collect",
-            sum_profile_stage(profiles, |p| p.timings.completion_collect_ns),
         ),
         (
             "install",

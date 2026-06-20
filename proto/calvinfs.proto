@@ -6,7 +6,6 @@ service Shard {
   rpc Ping(PingRequest) returns (PingResponse);
   rpc ExecuteBatch(ExecuteBatchRequest) returns (ExecuteBatchResponse);
   rpc LocalReadResult(LocalReadResultRequest) returns (LocalReadResultResponse);
-  rpc ReportSccCompletion(SccCompletionReportRequest) returns (SccCompletionReportResponse);
   rpc GetTxResult(GetTxResultRequest) returns (GetTxResultResponse);
   rpc DumpState(DumpStateRequest) returns (DumpStateResponse);
 }
@@ -44,14 +43,6 @@ message LocalReadResultRequest {
 }
 
 message LocalReadResultResponse {}
-
-message SccCompletionReportRequest {
-  uint64 batch_id = 1;
-  uint64 from_shard = 2;
-  repeated uint32 failed_tx_indices = 3;
-}
-
-message SccCompletionReportResponse {}
 
 message GetTxResultRequest {
   uint64 tx_id = 1;

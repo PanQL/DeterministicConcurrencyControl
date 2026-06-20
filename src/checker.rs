@@ -42,12 +42,35 @@ pub fn reference_execute_scc_reordered_batches(
 }
 
 pub fn assert_scc_reorders_consistent(
+    batches: &[Batch],
     shard_reorders: Vec<(ShardId, Vec<SccReorderRecord>)>,
 ) -> Result<BTreeMap<BatchId, SccReorderRecord>> {
-    let mut expected: Option<(ShardId, BTreeMap<BatchId, SccReorderRecord>)> = None;
+    let mut batch_by_id = BTreeMap::new();
+    for batch in batches {
+        if batch_by_id.insert(batch.batch_id, batch).is_some() {
+            return Err(Error::Checker(format!(
+                "duplicate SCC batch id {} in reference batches",
+                batch.batch_id
+            )));
+        }
+    }
+    let expected_batch_ids: BTreeSet<BatchId> = batch_by_id.keys().copied().collect();
+    let mut fallback_by_batch: BTreeMap<BatchId, BTreeSet<usize>> = BTreeMap::new();
+
     for (shard_id, records) in shard_reorders {
         let mut by_batch = BTreeMap::new();
         for record in records {
+            let batch = batch_by_id.get(&record.batch_id).ok_or_else(|| {
+                Error::Checker(format!(
+                    "shard {} reported SCC reorder for unknown batch {}",
+                    shard_id, record.batch_id
+                ))
+            })?;
+            validate_reorder_record(batch, &record)?;
+            fallback_by_batch
+                .entry(record.batch_id)
+                .or_default()
+                .extend(record.fallback_indices.iter().copied());
             if by_batch.insert(record.batch_id, record).is_some() {
                 return Err(Error::Checker(format!(
                     "shard {} reported duplicate SCC reorder for a batch",
@@ -55,18 +78,50 @@ pub fn assert_scc_reorders_consistent(
                 )));
             }
         }
-        if let Some((expected_shard, expected_records)) = &expected {
-            if &by_batch != expected_records {
-                return Err(Error::Checker(format!(
-                    "SCC reorder mismatch between shard {} and shard {}: expected {:?}, got {:?}",
-                    expected_shard, shard_id, expected_records, by_batch
-                )));
-            }
-        } else {
-            expected = Some((shard_id, by_batch));
+        let actual_batch_ids: BTreeSet<BatchId> = by_batch.keys().copied().collect();
+        if actual_batch_ids != expected_batch_ids {
+            return Err(Error::Checker(format!(
+                "shard {} SCC reorder batches mismatch: expected {:?}, got {:?}",
+                shard_id, expected_batch_ids, actual_batch_ids
+            )));
         }
     }
-    Ok(expected.map(|(_, records)| records).unwrap_or_default())
+
+    let mut reference_reorders = BTreeMap::new();
+    for batch in batches {
+        let fallback_set = fallback_by_batch
+            .remove(&batch.batch_id)
+            .unwrap_or_default();
+        let all_indices: BTreeSet<usize> = (0..batch.txs.len()).collect();
+        if !fallback_set.is_subset(&all_indices) {
+            return Err(Error::Checker(format!(
+                "SCC fallback union for batch {} contains index outside batch length {}: {:?}",
+                batch.batch_id,
+                batch.txs.len(),
+                fallback_set
+            )));
+        }
+        reference_reorders.insert(
+            batch.batch_id,
+            SccReorderRecord {
+                batch_id: batch.batch_id,
+                speculative_success_indices: all_indices
+                    .difference(&fallback_set)
+                    .copied()
+                    .collect(),
+                fallback_indices: fallback_set.into_iter().collect(),
+            },
+        );
+    }
+
+    if !fallback_by_batch.is_empty() {
+        return Err(Error::Checker(format!(
+            "SCC fallback union contains unknown batches: {:?}",
+            fallback_by_batch.keys().collect::<Vec<_>>()
+        )));
+    }
+
+    Ok(reference_reorders)
 }
 
 pub fn merge_shard_states(

@@ -72,7 +72,6 @@ struct ShardCore {
     peer_endpoints: Arc<BTreeMap<ShardId, String>>,
     mailboxes: ReadResultMailboxRegistry,
     client_results: TxResultRegistry,
-    scc_completion_reports: SccCompletionReportRegistry,
     scc_reorders: Arc<Mutex<BTreeMap<BatchId, SccReorderRecord>>>,
     scheduler_profiles: Arc<Mutex<BTreeMap<(BatchId, ShardId), SchedulerProfileRecord>>>,
     scheduler_profile_enabled: bool,
@@ -138,7 +137,6 @@ impl ShardRuntime {
             peer_endpoints: Arc::new(config.peer_endpoints),
             mailboxes: ReadResultMailboxRegistry::new(),
             client_results: TxResultRegistry::new(),
-            scc_completion_reports: SccCompletionReportRegistry::new(),
             scc_reorders: Arc::new(Mutex::new(BTreeMap::new())),
             scheduler_profiles: Arc::new(Mutex::new(BTreeMap::new())),
             scheduler_profile_enabled: scheduler_profile_enabled_from_env(),
@@ -189,10 +187,6 @@ impl ShardRuntime {
             .collect()
     }
 
-    pub async fn route_scc_completion_report(&self, report: SccCompletionReport) -> Result<()> {
-        self.core.scc_completion_reports.route(report).await
-    }
-
     pub async fn dump_scheduler_profiles(&self) -> Vec<SchedulerProfileRecord> {
         self.core
             .scheduler_profiles
@@ -232,9 +226,6 @@ async fn execute_batch_on_shard(
     };
     let cleanup_started = Instant::now();
     core.mailboxes.cleanup_batch(batch.batch_id).await;
-    core.scc_completion_reports
-        .cleanup_batch(batch.batch_id)
-        .await;
     let cleanup_ns = elapsed_ns(cleanup_started);
 
     if let Ok(profiled) = &mut result {
@@ -455,10 +446,6 @@ async fn execute_scc_batch(
     let commit_seq = Arc::new(CommitSequence::new(batch.txs.len()));
     let (mut dag_runtime, waiters) = SccDagRuntime::new(&plan);
     let mut waiters_by_tx: Vec<Option<TxDagWaiters>> = waiters.into_iter().map(Some).collect();
-    let mut completion_rx = core
-        .scc_completion_reports
-        .receiver(batch.batch_id, core.layout.shard_count as usize)
-        .await?;
     add_timing(&mut profile, |timings| {
         timings.dag_setup_ns = elapsed_ns(dag_setup_started);
     });
@@ -596,67 +583,40 @@ async fn execute_scc_batch(
         }
     }
     let snapshot = commit_seq.terminal_snapshot();
-    let local_failed_indices = failed_indices_from_snapshot(&snapshot);
-
-    let completion_publish_started = Instant::now();
-    let completion_reports_sent =
-        publish_scc_completion_report(core.clone(), batch.batch_id, local_failed_indices.clone())
-            .await?;
-    add_timing(&mut profile, |timings| {
-        timings.completion_publish_ns = elapsed_ns(completion_publish_started);
-    });
-    add_counter(&mut profile, |counters| {
-        counters.local_failed_count = usize_to_u64(local_failed_indices.len());
-        counters.completion_reports_sent = usize_to_u64(completion_reports_sent);
-    });
-
-    let completion_collect_started = Instant::now();
-    let completion_collection =
-        collect_scc_completion_reports(core.clone(), batch.batch_id, &mut completion_rx).await?;
-    let global_failed_indices = completion_collection.failed_indices;
-    add_timing(&mut profile, |timings| {
-        timings.completion_collect_ns = elapsed_ns(completion_collect_started);
-    });
-    add_counter(&mut profile, |counters| {
-        counters.global_failed_count = usize_to_u64(global_failed_indices.len());
-        counters.completion_reports_received = usize_to_u64(completion_collection.report_count);
-    });
+    let failed_indices = failed_indices_from_snapshot(&snapshot);
 
     let record_started = Instant::now();
     record_scc_reorder(
         core.clone(),
         batch.batch_id,
         batch.txs.len(),
-        &global_failed_indices,
+        &failed_indices,
     )
     .await?;
     add_timing(&mut profile, |timings| {
         timings.record_reorder_ns = elapsed_ns(record_started);
     });
+    if let Some(profile) = &mut profile {
+        profile.counters.local_failed_count = usize_to_u64(failed_indices.len());
+        profile.counters.global_failed_count = usize_to_u64(failed_indices.len());
+    }
 
     let mut tx_results = Vec::new();
     for (tx_index, record) in speculative_records {
-        if global_failed_indices.contains(&tx_index) {
-            let tx = &batch.txs[tx_index];
-            if core.layout.result_shard(tx) == Some(core.shard_id) {
-                return Err(Error::InvalidBatch(format!(
-                    "tx {} published speculative success but appears in global failed set",
-                    tx.tx_id
-                )));
-            }
+        if failed_indices.contains(&tx_index) {
             continue;
         }
         tx_results.push(record);
     }
 
     let install_started = Instant::now();
-    install_scc_successes(core.clone(), &snapshot, &global_failed_indices)?;
+    install_scc_successes(core.clone(), &snapshot, &failed_indices)?;
     add_timing(&mut profile, |timings| {
         timings.install_successes_ns = elapsed_ns(install_started);
     });
 
-    if !global_failed_indices.is_empty() {
-        let fallback_batch = fallback_batch_from_failed_indices(&batch, &global_failed_indices);
+    if !failed_indices.is_empty() {
+        let fallback_batch = fallback_batch_from_failed_indices(&batch, &failed_indices);
         add_counter(&mut profile, |counters| {
             counters.fallback_tx_count = usize_to_u64(fallback_batch.txs.len());
         });
@@ -677,7 +637,7 @@ async fn execute_scc_batch(
     tx_results.sort_by_key(|record| (record.tx_id, record.shard_id));
     if let Some(profile) = &mut profile {
         profile.counters.speculative_success_count =
-            usize_to_u64(batch.txs.len().saturating_sub(global_failed_indices.len()));
+            usize_to_u64(batch.txs.len().saturating_sub(failed_indices.len()));
         profile.counters.result_records_produced = usize_to_u64(tx_results.len());
     }
     Ok(ProfiledBatchExecution {
@@ -1587,20 +1547,17 @@ async fn record_scc_reorder(
     core: Arc<ShardCore>,
     batch_id: BatchId,
     batch_len: usize,
-    global_failed_indices: &BTreeSet<usize>,
+    failed_indices: &BTreeSet<usize>,
 ) -> Result<()> {
     let all_indices: BTreeSet<usize> = (0..batch_len).collect();
-    if !global_failed_indices.is_subset(&all_indices) {
+    if !failed_indices.is_subset(&all_indices) {
         return Err(Error::InvalidBatch(format!(
-            "SCC global failed set {:?} contains index outside batch length {}",
-            global_failed_indices, batch_len
+            "SCC failed set {:?} contains index outside batch length {}",
+            failed_indices, batch_len
         )));
     }
-    let speculative_success_indices = all_indices
-        .difference(global_failed_indices)
-        .copied()
-        .collect();
-    let fallback_indices = global_failed_indices.iter().copied().collect();
+    let speculative_success_indices = all_indices.difference(failed_indices).copied().collect();
+    let fallback_indices = failed_indices.iter().copied().collect();
     let record = SccReorderRecord {
         batch_id,
         speculative_success_indices,
@@ -1624,110 +1581,13 @@ fn failed_indices_from_snapshot(snapshot: &[CommitSlotState]) -> BTreeSet<usize>
         .collect()
 }
 
-async fn publish_scc_completion_report(
-    core: Arc<ShardCore>,
-    batch_id: BatchId,
-    failed_tx_indices: BTreeSet<usize>,
-) -> Result<usize> {
-    core.scc_completion_reports
-        .route(SccCompletionReport {
-            batch_id,
-            from_shard: core.shard_id,
-            failed_tx_indices: failed_tx_indices.clone(),
-        })
-        .await?;
-
-    let from_shard = core.shard_id;
-    let peers: Vec<String> = core
-        .peer_endpoints
-        .iter()
-        .filter_map(|(peer, endpoint)| (*peer != from_shard).then_some(endpoint.clone()))
-        .collect();
-    let report_count = peers.len() + 1;
-    let mut handles = Vec::new();
-    for endpoint in peers {
-        let endpoint = endpoint.clone();
-        let failed_tx_indices = failed_tx_indices.clone();
-        handles.push(tokio::spawn(async move {
-            let mut client = pb::shard_client::ShardClient::connect(endpoint).await?;
-            client
-                .report_scc_completion(pb::SccCompletionReportRequest {
-                    batch_id,
-                    from_shard,
-                    failed_tx_indices: failed_tx_indices
-                        .into_iter()
-                        .map(|index| index as u32)
-                        .collect(),
-                })
-                .await?;
-            Ok::<_, Error>(())
-        }));
-    }
-
-    for handle in handles {
-        handle
-            .await
-            .map_err(|err| Error::TaskJoin(err.to_string()))??;
-    }
-    Ok(report_count)
-}
-
-struct SccCompletionCollection {
-    failed_indices: BTreeSet<usize>,
-    report_count: usize,
-}
-
-async fn collect_scc_completion_reports(
-    core: Arc<ShardCore>,
-    batch_id: BatchId,
-    completion_rx: &mut mpsc::Receiver<SccCompletionReport>,
-) -> Result<SccCompletionCollection> {
-    let expected: BTreeSet<ShardId> = (0..core.layout.shard_count).collect();
-    let mut reports: BTreeMap<ShardId, BTreeSet<usize>> = BTreeMap::new();
-    while reports.len() < expected.len() {
-        let report = completion_rx.recv().await.ok_or_else(|| {
-            Error::ChannelClosed(format!(
-                "SCC completion report channel closed for batch {}",
-                batch_id
-            ))
-        })?;
-        if report.batch_id != batch_id {
-            return Err(Error::InvalidBatch(format!(
-                "SCC completion report routed to wrong batch: got {}, expected {}",
-                report.batch_id, batch_id
-            )));
-        }
-        if !expected.contains(&report.from_shard) {
-            return Err(Error::InvalidBatch(format!(
-                "SCC completion report from unexpected shard {}",
-                report.from_shard
-            )));
-        }
-        if reports
-            .insert(report.from_shard, report.failed_tx_indices)
-            .is_some()
-        {
-            return Err(Error::InvalidBatch(format!(
-                "duplicate SCC completion report from shard {}",
-                report.from_shard
-            )));
-        }
-    }
-
-    let report_count = reports.len();
-    Ok(SccCompletionCollection {
-        failed_indices: reports.into_values().flatten().collect(),
-        report_count,
-    })
-}
-
 fn install_scc_successes(
     core: Arc<ShardCore>,
     snapshot: &[CommitSlotState],
-    global_failed_indices: &BTreeSet<usize>,
+    failed_indices: &BTreeSet<usize>,
 ) -> Result<()> {
     for (tx_index, state) in snapshot.iter().enumerate() {
-        if global_failed_indices.contains(&tx_index) {
+        if failed_indices.contains(&tx_index) {
             continue;
         }
         match state {
@@ -1739,7 +1599,7 @@ fn install_scc_successes(
             }
             CommitSlotState::Failed => {
                 return Err(Error::InvalidBatch(format!(
-                    "SCC commit slot {} failed but is absent from global failed set",
+                    "SCC commit slot {} failed but is absent from failed set",
                     tx_index
                 )))
             }
@@ -1847,81 +1707,6 @@ impl Default for ReadResultMailboxRegistry {
 fn new_mailbox(capacity: usize) -> MailboxEntry {
     let (sender, receiver) = mpsc::channel(capacity);
     MailboxEntry {
-        sender,
-        receiver: Some(receiver),
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct SccCompletionReport {
-    pub batch_id: BatchId,
-    pub from_shard: ShardId,
-    pub failed_tx_indices: BTreeSet<usize>,
-}
-
-#[derive(Clone)]
-pub struct SccCompletionReportRegistry {
-    inner: Arc<Mutex<BTreeMap<BatchId, SccCompletionReportEntry>>>,
-}
-
-struct SccCompletionReportEntry {
-    sender: mpsc::Sender<SccCompletionReport>,
-    receiver: Option<mpsc::Receiver<SccCompletionReport>>,
-}
-
-impl SccCompletionReportRegistry {
-    pub fn new() -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(BTreeMap::new())),
-        }
-    }
-
-    pub async fn receiver(
-        &self,
-        batch_id: BatchId,
-        capacity: usize,
-    ) -> Result<mpsc::Receiver<SccCompletionReport>> {
-        let mut inner = self.inner.lock().await;
-        let entry = inner
-            .entry(batch_id)
-            .or_insert_with(|| new_completion_report_entry(capacity.max(1)));
-        entry.receiver.take().ok_or_else(|| {
-            Error::InvalidBatch(format!(
-                "SCC completion report receiver already taken for batch {}",
-                batch_id
-            ))
-        })
-    }
-
-    pub async fn route(&self, report: SccCompletionReport) -> Result<()> {
-        let sender = {
-            let mut inner = self.inner.lock().await;
-            inner
-                .entry(report.batch_id)
-                .or_insert_with(|| new_completion_report_entry(DEFAULT_MAILBOX_CAPACITY))
-                .sender
-                .clone()
-        };
-        sender.send(report).await.map_err(|_| {
-            Error::ChannelClosed("SCC completion report receiver is closed".to_string())
-        })
-    }
-
-    pub async fn cleanup_batch(&self, batch_id: BatchId) {
-        let mut inner = self.inner.lock().await;
-        inner.remove(&batch_id);
-    }
-}
-
-impl Default for SccCompletionReportRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-fn new_completion_report_entry(capacity: usize) -> SccCompletionReportEntry {
-    let (sender, receiver) = mpsc::channel(capacity);
-    SccCompletionReportEntry {
         sender,
         receiver: Some(receiver),
     }
