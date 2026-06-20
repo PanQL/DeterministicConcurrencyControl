@@ -1,7 +1,7 @@
 use crate::convert::{
     batch_from_proto, fs_op_from_proto, inode_entries_to_proto, local_read_status_from_i32,
     read_entries_from_proto, read_phase_from_i32, scc_reorder_records_to_proto,
-    tx_result_records_to_proto, tx_result_to_i32,
+    scheduler_profile_records_to_proto, tx_result_records_to_proto, tx_result_to_i32,
 };
 use crate::engine::{
     ClientTxResult, LocalReadResult, SccCompletionReport, SequencerRuntime, ShardRuntime,
@@ -126,9 +126,11 @@ impl pb::shard_server::Shard for ShardService {
     ) -> std::result::Result<Response<pb::DumpStateResponse>, Status> {
         let state = self.runtime.dump_state().map_err(Status::from)?;
         let scc_reorders = self.runtime.dump_scc_reorders().await;
+        let scheduler_profiles = self.runtime.dump_scheduler_profiles().await;
         Ok(Response::new(pb::DumpStateResponse {
             entries: inode_entries_to_proto(&state),
             scc_reorders: scc_reorder_records_to_proto(&scc_reorders),
+            scheduler_profiles: scheduler_profile_records_to_proto(&scheduler_profiles),
         }))
     }
 }

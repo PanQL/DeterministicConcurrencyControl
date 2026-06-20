@@ -195,6 +195,97 @@ pub struct SccReorderRecord {
     pub fallback_indices: Vec<usize>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SchedulerProfileScheduler {
+    CalvinLocking,
+    SccOnline,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct WorkerStageStats {
+    pub sum_ns: u64,
+    pub max_ns: u64,
+}
+
+impl WorkerStageStats {
+    pub fn add_sample(&mut self, ns: u64) {
+        self.sum_ns = self.sum_ns.saturating_add(ns);
+        self.max_ns = self.max_ns.max(ns);
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SchedulerProfileCounters {
+    pub tx_count: u64,
+    pub relevant_tx_count: u64,
+    pub active_tx_count: u64,
+    pub passive_tx_count: u64,
+    pub non_participant_tx_count: u64,
+    pub local_read_key_count: u64,
+    pub local_write_key_count: u64,
+    pub remote_read_messages_sent: u64,
+    pub remote_read_messages_received: u64,
+    pub result_records_produced: u64,
+    pub lock_key_count: u64,
+    pub plan_pair_count: u64,
+    pub effect_edge_count: u64,
+    pub condition_edge_count: u64,
+    pub condition_skipped_count: u64,
+    pub speculative_success_count: u64,
+    pub local_failed_count: u64,
+    pub global_failed_count: u64,
+    pub fallback_tx_count: u64,
+    pub delta_op_count: u64,
+    pub completion_reports_sent: u64,
+    pub completion_reports_received: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SchedulerProfileTimings {
+    pub total_ns: u64,
+    pub cleanup_ns: u64,
+    pub validate_ns: u64,
+    pub result_registry_ns: u64,
+    pub lock_wait_sum_ns: u64,
+    pub lock_wait_max_ns: u64,
+    pub local_read_ns: u64,
+    pub remote_read_send_ns: u64,
+    pub remote_read_collect_ns: u64,
+    pub execute_apply_ns: u64,
+    pub result_mark_ns: u64,
+    pub outcome_collect_release_ns: u64,
+    pub plan_build_ns: u64,
+    pub dag_setup_ns: u64,
+    pub base_read_ns: u64,
+    pub mailbox_spawn_ns: u64,
+    pub completion_publish_ns: u64,
+    pub completion_collect_ns: u64,
+    pub record_reorder_ns: u64,
+    pub install_successes_ns: u64,
+    pub fallback_ns: u64,
+    pub scc_effect_wait: WorkerStageStats,
+    pub scc_effect_materialize: WorkerStageStats,
+    pub scc_effect_send: WorkerStageStats,
+    pub scc_effect_collect: WorkerStageStats,
+    pub scc_execute: WorkerStageStats,
+    pub scc_delta_build: WorkerStageStats,
+    pub scc_condition_wait: WorkerStageStats,
+    pub scc_condition_materialize: WorkerStageStats,
+    pub scc_condition_send: WorkerStageStats,
+    pub scc_condition_collect: WorkerStageStats,
+    pub scc_condition_check: WorkerStageStats,
+    pub scc_commit: WorkerStageStats,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SchedulerProfileRecord {
+    pub scheduler: SchedulerProfileScheduler,
+    pub batch_id: BatchId,
+    pub shard_id: ShardId,
+    pub counters: SchedulerProfileCounters,
+    pub timings: SchedulerProfileTimings,
+}
+
 pub fn parent_key(path: &Key) -> Result<Key> {
     path.parent()
 }

@@ -69,6 +69,7 @@ message DumpStateRequest {}
 message DumpStateResponse {
   repeated InodeEntry entries = 1;
   repeated SccReorderRecord scc_reorders = 2;
+  repeated SchedulerProfileRecord scheduler_profiles = 3;
 }
 
 message Batch {
@@ -185,6 +186,86 @@ message SccReorderRecord {
   uint64 batch_id = 1;
   repeated uint32 speculative_success_indices = 2;
   repeated uint32 fallback_indices = 3;
+}
+
+enum SchedulerProfileScheduler {
+  SCHEDULER_PROFILE_SCHEDULER_UNSPECIFIED = 0;
+  SCHEDULER_PROFILE_SCHEDULER_CALVIN_LOCKING = 1;
+  SCHEDULER_PROFILE_SCHEDULER_SCC_ONLINE = 2;
+}
+
+message WorkerStageStats {
+  uint64 sum_ns = 1;
+  uint64 max_ns = 2;
+}
+
+message SchedulerProfileCounters {
+  uint64 tx_count = 1;
+  uint64 relevant_tx_count = 2;
+  uint64 active_tx_count = 3;
+  uint64 passive_tx_count = 4;
+  uint64 non_participant_tx_count = 5;
+  uint64 local_read_key_count = 6;
+  uint64 local_write_key_count = 7;
+  uint64 remote_read_messages_sent = 8;
+  uint64 remote_read_messages_received = 9;
+  uint64 result_records_produced = 10;
+  uint64 lock_key_count = 11;
+  uint64 plan_pair_count = 12;
+  uint64 effect_edge_count = 13;
+  uint64 condition_edge_count = 14;
+  uint64 condition_skipped_count = 15;
+  uint64 speculative_success_count = 16;
+  uint64 local_failed_count = 17;
+  uint64 global_failed_count = 18;
+  uint64 fallback_tx_count = 19;
+  uint64 delta_op_count = 20;
+  uint64 completion_reports_sent = 21;
+  uint64 completion_reports_received = 22;
+}
+
+message SchedulerProfileTimings {
+  uint64 total_ns = 1;
+  uint64 cleanup_ns = 2;
+  uint64 validate_ns = 3;
+  uint64 result_registry_ns = 4;
+  uint64 lock_wait_sum_ns = 5;
+  uint64 lock_wait_max_ns = 6;
+  uint64 local_read_ns = 7;
+  uint64 remote_read_send_ns = 8;
+  uint64 remote_read_collect_ns = 9;
+  uint64 execute_apply_ns = 10;
+  uint64 result_mark_ns = 11;
+  uint64 outcome_collect_release_ns = 12;
+  uint64 plan_build_ns = 13;
+  uint64 dag_setup_ns = 14;
+  uint64 base_read_ns = 15;
+  uint64 mailbox_spawn_ns = 16;
+  uint64 completion_publish_ns = 17;
+  uint64 completion_collect_ns = 18;
+  uint64 record_reorder_ns = 19;
+  uint64 install_successes_ns = 20;
+  uint64 fallback_ns = 21;
+  WorkerStageStats scc_effect_wait = 22;
+  WorkerStageStats scc_effect_materialize = 23;
+  WorkerStageStats scc_effect_send = 24;
+  WorkerStageStats scc_effect_collect = 25;
+  WorkerStageStats scc_execute = 26;
+  WorkerStageStats scc_delta_build = 27;
+  WorkerStageStats scc_condition_wait = 28;
+  WorkerStageStats scc_condition_materialize = 29;
+  WorkerStageStats scc_condition_send = 30;
+  WorkerStageStats scc_condition_collect = 31;
+  WorkerStageStats scc_condition_check = 32;
+  WorkerStageStats scc_commit = 33;
+}
+
+message SchedulerProfileRecord {
+  SchedulerProfileScheduler scheduler = 1;
+  uint64 batch_id = 2;
+  uint64 shard_id = 3;
+  SchedulerProfileCounters counters = 4;
+  SchedulerProfileTimings timings = 5;
 }
 
 message SubmitTxRequest {

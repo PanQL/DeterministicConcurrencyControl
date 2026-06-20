@@ -8,25 +8,39 @@ use crate::executor::{
 use crate::lock::{LockGrant, LockTable};
 use crate::model::{
     Batch, BatchId, FsOp, Inode, Key, LocalReadStatus, OrderedTx, ReadPhase, ReadValue,
-    SccReorderRecord, ShardId, TxId, TxResult, TxResultRecord,
+    SccReorderRecord, SchedulerProfileCounters, SchedulerProfileRecord, SchedulerProfileScheduler,
+    SchedulerProfileTimings, ShardId, TxId, TxResult, TxResultRecord, WorkerStageStats,
 };
 use crate::proto::pb;
 use crate::router::{Participants, ShardLayout};
 use crate::scc::{
     build_scc_batch_plan, check_success_path_condition, classify_actual_path, filter_delta_to_keys,
     materialized_local_read, output_to_delta, CommitSequence, CommitSlotState, SccDagRuntime,
-    SccPhase, SccTxPlan, TxDagWaiters, TxDelta,
+    SccPhase, SccTxPlan, SemanticDag, TxDagWaiters, TxDelta,
 };
 use crate::storage::RedbInMemoryInodeStore;
 use std::collections::{BTreeMap, BTreeSet};
+use std::env;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
 
 const BATCH_QUEUE_CAPACITY: usize = 16;
 const DEFAULT_MAILBOX_CAPACITY: usize = 1024;
 const SEQUENCER_COMMAND_CAPACITY: usize = 1024;
 const DEFAULT_BATCH_FLUSH_INTERVAL: Duration = Duration::from_millis(1);
+const SCHEDULER_PROFILE_ENV: &str = "CALVINFS_SCHED_PROFILE";
+
+fn scheduler_profile_enabled_from_env() -> bool {
+    env::var_os(SCHEDULER_PROFILE_ENV)
+        .and_then(|value| value.into_string().ok())
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum SchedulerKind {
@@ -60,6 +74,8 @@ struct ShardCore {
     client_results: TxResultRegistry,
     scc_completion_reports: SccCompletionReportRegistry,
     scc_reorders: Arc<Mutex<BTreeMap<BatchId, SccReorderRecord>>>,
+    scheduler_profiles: Arc<Mutex<BTreeMap<(BatchId, ShardId), SchedulerProfileRecord>>>,
+    scheduler_profile_enabled: bool,
     scheduler: SchedulerKind,
 }
 
@@ -67,6 +83,43 @@ pub struct BatchExecutionSummary {
     pub batch_id: BatchId,
     pub shard_id: ShardId,
     pub tx_results: Vec<TxResultRecord>,
+}
+
+struct ProfiledBatchExecution {
+    summary: BatchExecutionSummary,
+    profile: Option<SchedulerProfileRecord>,
+}
+
+#[derive(Default)]
+struct CalvinWorkerProfile {
+    lock_wait_ns: u64,
+    local_read_ns: u64,
+    remote_read_send_ns: u64,
+    remote_read_collect_ns: u64,
+    execute_apply_ns: u64,
+    result_mark_ns: u64,
+    remote_sent: u64,
+    remote_received: u64,
+}
+
+#[derive(Default)]
+struct SccWorkerProfile {
+    effect_wait_ns: u64,
+    effect_materialize_ns: u64,
+    effect_send_ns: u64,
+    effect_collect_ns: u64,
+    execute_ns: u64,
+    delta_build_ns: u64,
+    condition_wait_ns: u64,
+    condition_materialize_ns: u64,
+    condition_send_ns: u64,
+    condition_collect_ns: u64,
+    condition_check_ns: u64,
+    commit_ns: u64,
+    remote_sent: u64,
+    remote_received: u64,
+    condition_skipped: bool,
+    delta_op_count: u64,
 }
 
 struct BatchJob {
@@ -87,6 +140,8 @@ impl ShardRuntime {
             client_results: TxResultRegistry::new(),
             scc_completion_reports: SccCompletionReportRegistry::new(),
             scc_reorders: Arc::new(Mutex::new(BTreeMap::new())),
+            scheduler_profiles: Arc::new(Mutex::new(BTreeMap::new())),
+            scheduler_profile_enabled: scheduler_profile_enabled_from_env(),
             scheduler: config.scheduler,
         });
         tokio::spawn(run_batch_executor(core.clone(), batch_rx));
@@ -137,6 +192,16 @@ impl ShardRuntime {
     pub async fn route_scc_completion_report(&self, report: SccCompletionReport) -> Result<()> {
         self.core.scc_completion_reports.route(report).await
     }
+
+    pub async fn dump_scheduler_profiles(&self) -> Vec<SchedulerProfileRecord> {
+        self.core
+            .scheduler_profiles
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect()
+    }
 }
 
 async fn run_batch_executor(core: Arc<ShardCore>, mut batch_rx: mpsc::Receiver<BatchJob>) {
@@ -150,46 +215,116 @@ async fn execute_batch_on_shard(
     core: Arc<ShardCore>,
     batch: Batch,
 ) -> Result<BatchExecutionSummary> {
-    let result = match core.scheduler {
-        SchedulerKind::CalvinLocking => execute_calvin_batch(core.clone(), batch.clone()).await,
-        SchedulerKind::SccOnline => execute_scc_batch(core.clone(), batch.clone()).await,
+    let profile_started = Instant::now();
+    let mut result = match core.scheduler {
+        SchedulerKind::CalvinLocking => {
+            execute_calvin_batch(
+                core.clone(),
+                batch.clone(),
+                core.scheduler_profile_enabled,
+                SchedulerProfileScheduler::CalvinLocking,
+            )
+            .await
+        }
+        SchedulerKind::SccOnline => {
+            execute_scc_batch(core.clone(), batch.clone(), core.scheduler_profile_enabled).await
+        }
     };
+    let cleanup_started = Instant::now();
     core.mailboxes.cleanup_batch(batch.batch_id).await;
     core.scc_completion_reports
         .cleanup_batch(batch.batch_id)
         .await;
-    result
+    let cleanup_ns = elapsed_ns(cleanup_started);
+
+    if let Ok(profiled) = &mut result {
+        if let Some(profile) = &mut profiled.profile {
+            profile.timings.cleanup_ns = cleanup_ns;
+            profile.timings.total_ns = elapsed_ns(profile_started);
+            let mut profiles = core.scheduler_profiles.lock().await;
+            profiles.insert((profile.batch_id, profile.shard_id), profile.clone());
+        }
+    }
+
+    result.map(|profiled| profiled.summary)
 }
 
-async fn execute_calvin_batch(core: Arc<ShardCore>, batch: Batch) -> Result<BatchExecutionSummary> {
+async fn execute_calvin_batch(
+    core: Arc<ShardCore>,
+    batch: Batch,
+    profile_enabled: bool,
+    profile_scheduler: SchedulerProfileScheduler,
+) -> Result<ProfiledBatchExecution> {
+    let mut profile =
+        profile_enabled.then(|| new_scheduler_profile(profile_scheduler, &batch, &core));
+    let started = Instant::now();
     validate_batch_order(&batch)?;
+    add_timing(&mut profile, |timings| {
+        timings.validate_ns = timings.validate_ns.saturating_add(elapsed_ns(started));
+    });
 
     let mut lock_table = LockTable::new();
     let mut relevant_count = 0usize;
     let (outcome_tx, mut outcome_rx) = mpsc::channel(batch.txs.len().max(1));
 
     for tx in &batch.txs {
+        let validate_started = Instant::now();
         validate_sets(tx)?;
+        add_timing(&mut profile, |timings| {
+            timings.validate_ns = timings
+                .validate_ns
+                .saturating_add(elapsed_ns(validate_started));
+        });
         let result_shard = core
             .layout
             .result_shard(tx)
             .ok_or_else(|| Error::InvalidBatch(format!("tx {} has no result shard", tx.tx_id)))?;
+        let registry_started = Instant::now();
         if result_shard == core.shard_id {
             core.client_results.ensure_pending(tx.tx_id).await;
         } else {
             core.client_results.mark_not_responsible(tx.tx_id).await;
         }
+        add_timing(&mut profile, |timings| {
+            timings.result_registry_ns = timings
+                .result_registry_ns
+                .saturating_add(elapsed_ns(registry_started));
+        });
 
         let local_keys = core.layout.local_lock_keys(tx, core.shard_id);
+        if let Some(profile) = &mut profile {
+            let local_read_keys = core.layout.local_read_keys(tx, core.shard_id);
+            let local_write_keys = core.layout.local_write_keys(tx, core.shard_id);
+            profile.counters.local_read_key_count = profile
+                .counters
+                .local_read_key_count
+                .saturating_add(usize_to_u64(local_read_keys.len()));
+            profile.counters.local_write_key_count = profile
+                .counters
+                .local_write_key_count
+                .saturating_add(usize_to_u64(local_write_keys.len()));
+            profile.counters.lock_key_count = profile
+                .counters
+                .lock_key_count
+                .saturating_add(usize_to_u64(local_keys.len()));
+        }
         if local_keys.is_empty() {
+            add_counter(&mut profile, |counters| {
+                counters.non_participant_tx_count =
+                    counters.non_participant_tx_count.saturating_add(1);
+            });
             continue;
         }
 
         relevant_count += 1;
+        add_counter(&mut profile, |counters| {
+            counters.relevant_tx_count = counters.relevant_tx_count.saturating_add(1);
+        });
         let (grant_tx, grant_rx) = mpsc::channel(local_keys.len().max(1));
         lock_table.enqueue(tx.tx_id, &local_keys, grant_tx);
 
         let participants = core.layout.participants(tx);
+        add_participant_counters(&mut profile, &participants, core.shard_id);
         let remote_rx = if participants.active.contains(&core.shard_id) {
             Some(
                 core.mailboxes
@@ -214,6 +349,7 @@ async fn execute_calvin_batch(core: Arc<ShardCore>, batch: Batch) -> Result<Batc
             local_keys,
             grant_rx,
             remote_rx,
+            profile_enabled,
             outcome_tx: outcome_tx.clone(),
         });
     }
@@ -223,6 +359,7 @@ async fn execute_calvin_batch(core: Arc<ShardCore>, batch: Batch) -> Result<Batc
 
     let mut tx_results = Vec::new();
     for _ in 0..relevant_count {
+        let collect_started = Instant::now();
         let outcome = outcome_rx.recv().await.ok_or_else(|| {
             Error::ChannelClosed("worker outcome channel closed before batch finished".to_string())
         })?;
@@ -230,36 +367,91 @@ async fn execute_calvin_batch(core: Arc<ShardCore>, batch: Batch) -> Result<Batc
         lock_table
             .release_and_grant_next(tx_id, &outcome.local_keys)
             .await?;
+        add_timing(&mut profile, |timings| {
+            timings.outcome_collect_release_ns = timings
+                .outcome_collect_release_ns
+                .saturating_add(elapsed_ns(collect_started));
+        });
         match outcome.result? {
-            WorkerCompletion::Active(record) => tx_results.push(record),
-            WorkerCompletion::Passive => {}
+            WorkerCompletion::Active(record, worker_profile) => {
+                merge_calvin_worker_profile(&mut profile, worker_profile);
+                tx_results.push(record);
+            }
+            WorkerCompletion::Passive(worker_profile) => {
+                merge_calvin_worker_profile(&mut profile, worker_profile);
+            }
         }
     }
 
     tx_results.sort_by_key(|record| (record.tx_id, record.shard_id));
-    Ok(BatchExecutionSummary {
-        batch_id: batch.batch_id,
-        shard_id: core.shard_id,
-        tx_results,
+    if let Some(profile) = &mut profile {
+        profile.counters.result_records_produced = usize_to_u64(tx_results.len());
+    }
+    Ok(ProfiledBatchExecution {
+        summary: BatchExecutionSummary {
+            batch_id: batch.batch_id,
+            shard_id: core.shard_id,
+            tx_results,
+        },
+        profile,
     })
 }
 
-async fn execute_scc_batch(core: Arc<ShardCore>, batch: Batch) -> Result<BatchExecutionSummary> {
+async fn execute_scc_batch(
+    core: Arc<ShardCore>,
+    batch: Batch,
+    profile_enabled: bool,
+) -> Result<ProfiledBatchExecution> {
+    let mut profile = profile_enabled.then(|| {
+        let mut profile =
+            new_scheduler_profile(SchedulerProfileScheduler::SccOnline, &batch, &core);
+        profile.counters.plan_pair_count = plan_pair_count(batch.txs.len());
+        profile
+    });
+
+    let validate_started = Instant::now();
     validate_batch_order(&batch)?;
+    add_timing(&mut profile, |timings| {
+        timings.validate_ns = timings
+            .validate_ns
+            .saturating_add(elapsed_ns(validate_started));
+    });
     for tx in &batch.txs {
+        let validate_started = Instant::now();
         validate_sets(tx)?;
+        add_timing(&mut profile, |timings| {
+            timings.validate_ns = timings
+                .validate_ns
+                .saturating_add(elapsed_ns(validate_started));
+        });
         let result_shard = core
             .layout
             .result_shard(tx)
             .ok_or_else(|| Error::InvalidBatch(format!("tx {} has no result shard", tx.tx_id)))?;
+        let registry_started = Instant::now();
         if result_shard == core.shard_id {
             core.client_results.ensure_pending(tx.tx_id).await;
         } else {
             core.client_results.mark_not_responsible(tx.tx_id).await;
         }
+        add_timing(&mut profile, |timings| {
+            timings.result_registry_ns = timings
+                .result_registry_ns
+                .saturating_add(elapsed_ns(registry_started));
+        });
     }
 
+    let plan_started = Instant::now();
     let plan = Arc::new(build_scc_batch_plan(&batch)?);
+    add_timing(&mut profile, |timings| {
+        timings.plan_build_ns = elapsed_ns(plan_started);
+    });
+    if let Some(profile) = &mut profile {
+        profile.counters.effect_edge_count = dag_edge_count(&plan.effect);
+        profile.counters.condition_edge_count = dag_edge_count(&plan.condition);
+    }
+
+    let dag_setup_started = Instant::now();
     let commit_seq = Arc::new(CommitSequence::new(batch.txs.len()));
     let (mut dag_runtime, waiters) = SccDagRuntime::new(&plan);
     let mut waiters_by_tx: Vec<Option<TxDagWaiters>> = waiters.into_iter().map(Some).collect();
@@ -267,6 +459,9 @@ async fn execute_scc_batch(core: Arc<ShardCore>, batch: Batch) -> Result<BatchEx
         .scc_completion_reports
         .receiver(batch.batch_id, core.layout.shard_count as usize)
         .await?;
+    add_timing(&mut profile, |timings| {
+        timings.dag_setup_ns = elapsed_ns(dag_setup_started);
+    });
 
     let local_write_keys_by_tx: Arc<Vec<BTreeSet<Key>>> = Arc::new(
         batch
@@ -284,7 +479,21 @@ async fn execute_scc_batch(core: Arc<ShardCore>, batch: Batch) -> Result<BatchEx
         .iter()
         .flat_map(|keys| keys.iter().cloned())
         .collect();
+    if let Some(profile) = &mut profile {
+        profile.counters.local_read_key_count = local_read_keys_by_tx
+            .iter()
+            .map(|keys| usize_to_u64(keys.len()))
+            .fold(0u64, u64::saturating_add);
+        profile.counters.local_write_key_count = local_write_keys_by_tx
+            .iter()
+            .map(|keys| usize_to_u64(keys.len()))
+            .fold(0u64, u64::saturating_add);
+    }
+    let base_read_started = Instant::now();
     let base_read_cache = Arc::new(core.store.read_many(&local_base_read_keys)?);
+    add_timing(&mut profile, |timings| {
+        timings.base_read_ns = elapsed_ns(base_read_started);
+    });
 
     let (outcome_tx, mut outcome_rx) = mpsc::channel(batch.txs.len().max(1));
     let mut relevant_count = 0usize;
@@ -295,11 +504,20 @@ async fn execute_scc_batch(core: Arc<ShardCore>, batch: Batch) -> Result<BatchEx
         let local_write_keys = local_write_keys_by_tx[tx_index].clone();
         if local_read_keys.is_empty() && local_write_keys.is_empty() {
             non_participant_indices.push(tx_index);
+            add_counter(&mut profile, |counters| {
+                counters.non_participant_tx_count =
+                    counters.non_participant_tx_count.saturating_add(1);
+            });
             continue;
         }
 
         relevant_count += 1;
+        add_counter(&mut profile, |counters| {
+            counters.relevant_tx_count = counters.relevant_tx_count.saturating_add(1);
+        });
         let participants = core.layout.participants(tx);
+        add_participant_counters(&mut profile, &participants, core.shard_id);
+        let mailbox_started = Instant::now();
         let effect_rx = core
             .mailboxes
             .receiver(
@@ -318,6 +536,11 @@ async fn execute_scc_batch(core: Arc<ShardCore>, batch: Batch) -> Result<BatchEx
                 participants.all.len().max(1),
             )
             .await?;
+        add_timing(&mut profile, |timings| {
+            timings.mailbox_spawn_ns = timings
+                .mailbox_spawn_ns
+                .saturating_add(elapsed_ns(mailbox_started));
+        });
         let result_shard = core
             .layout
             .result_shard(tx)
@@ -340,16 +563,23 @@ async fn execute_scc_batch(core: Arc<ShardCore>, batch: Batch) -> Result<BatchEx
             })?,
             effect_rx,
             condition_rx,
+            profile: profile_enabled.then(SccWorkerProfile::default),
             outcome_tx: outcome_tx.clone(),
         });
     }
     drop(outcome_tx);
 
+    let dag_setup_started = Instant::now();
     dag_runtime.start()?;
     for tx_index in non_participant_indices {
         commit_seq.set_terminal_once(tx_index, CommitSlotState::NoOp)?;
         dag_runtime.finish_vertex(tx_index)?;
     }
+    add_timing(&mut profile, |timings| {
+        timings.dag_setup_ns = timings
+            .dag_setup_ns
+            .saturating_add(elapsed_ns(dag_setup_started));
+    });
 
     let mut speculative_records = BTreeMap::new();
     for _ in 0..relevant_count {
@@ -360,15 +590,39 @@ async fn execute_scc_batch(core: Arc<ShardCore>, batch: Batch) -> Result<BatchEx
         })?;
         let completion = outcome.result?;
         dag_runtime.finish_vertex(outcome.tx_index)?;
+        merge_scc_worker_profile(&mut profile, completion.profile);
         if let Some(record) = completion.record {
             speculative_records.insert(outcome.tx_index, record);
         }
     }
     let snapshot = commit_seq.terminal_snapshot();
     let local_failed_indices = failed_indices_from_snapshot(&snapshot);
-    publish_scc_completion_report(core.clone(), batch.batch_id, local_failed_indices).await?;
-    let global_failed_indices =
+
+    let completion_publish_started = Instant::now();
+    let completion_reports_sent =
+        publish_scc_completion_report(core.clone(), batch.batch_id, local_failed_indices.clone())
+            .await?;
+    add_timing(&mut profile, |timings| {
+        timings.completion_publish_ns = elapsed_ns(completion_publish_started);
+    });
+    add_counter(&mut profile, |counters| {
+        counters.local_failed_count = usize_to_u64(local_failed_indices.len());
+        counters.completion_reports_sent = usize_to_u64(completion_reports_sent);
+    });
+
+    let completion_collect_started = Instant::now();
+    let completion_collection =
         collect_scc_completion_reports(core.clone(), batch.batch_id, &mut completion_rx).await?;
+    let global_failed_indices = completion_collection.failed_indices;
+    add_timing(&mut profile, |timings| {
+        timings.completion_collect_ns = elapsed_ns(completion_collect_started);
+    });
+    add_counter(&mut profile, |counters| {
+        counters.global_failed_count = usize_to_u64(global_failed_indices.len());
+        counters.completion_reports_received = usize_to_u64(completion_collection.report_count);
+    });
+
+    let record_started = Instant::now();
     record_scc_reorder(
         core.clone(),
         batch.batch_id,
@@ -376,6 +630,9 @@ async fn execute_scc_batch(core: Arc<ShardCore>, batch: Batch) -> Result<BatchEx
         &global_failed_indices,
     )
     .await?;
+    add_timing(&mut profile, |timings| {
+        timings.record_reorder_ns = elapsed_ns(record_started);
+    });
 
     let mut tx_results = Vec::new();
     for (tx_index, record) in speculative_records {
@@ -392,19 +649,44 @@ async fn execute_scc_batch(core: Arc<ShardCore>, batch: Batch) -> Result<BatchEx
         tx_results.push(record);
     }
 
+    let install_started = Instant::now();
     install_scc_successes(core.clone(), &snapshot, &global_failed_indices)?;
+    add_timing(&mut profile, |timings| {
+        timings.install_successes_ns = elapsed_ns(install_started);
+    });
 
     if !global_failed_indices.is_empty() {
         let fallback_batch = fallback_batch_from_failed_indices(&batch, &global_failed_indices);
-        let fallback_summary = execute_calvin_batch(core.clone(), fallback_batch).await?;
-        tx_results.extend(fallback_summary.tx_results);
+        add_counter(&mut profile, |counters| {
+            counters.fallback_tx_count = usize_to_u64(fallback_batch.txs.len());
+        });
+        let fallback_started = Instant::now();
+        let fallback_execution = execute_calvin_batch(
+            core.clone(),
+            fallback_batch,
+            false,
+            SchedulerProfileScheduler::CalvinLocking,
+        )
+        .await?;
+        add_timing(&mut profile, |timings| {
+            timings.fallback_ns = elapsed_ns(fallback_started);
+        });
+        tx_results.extend(fallback_execution.summary.tx_results);
     }
 
     tx_results.sort_by_key(|record| (record.tx_id, record.shard_id));
-    Ok(BatchExecutionSummary {
-        batch_id: batch.batch_id,
-        shard_id: core.shard_id,
-        tx_results,
+    if let Some(profile) = &mut profile {
+        profile.counters.speculative_success_count =
+            usize_to_u64(batch.txs.len().saturating_sub(global_failed_indices.len()));
+        profile.counters.result_records_produced = usize_to_u64(tx_results.len());
+    }
+    Ok(ProfiledBatchExecution {
+        summary: BatchExecutionSummary {
+            batch_id: batch.batch_id,
+            shard_id: core.shard_id,
+            tx_results,
+        },
+        profile,
     })
 }
 
@@ -427,6 +709,200 @@ fn validate_batch_order(batch: &Batch) -> Result<()> {
     Ok(())
 }
 
+fn new_scheduler_profile(
+    scheduler: SchedulerProfileScheduler,
+    batch: &Batch,
+    core: &ShardCore,
+) -> SchedulerProfileRecord {
+    SchedulerProfileRecord {
+        scheduler,
+        batch_id: batch.batch_id,
+        shard_id: core.shard_id,
+        counters: SchedulerProfileCounters {
+            tx_count: usize_to_u64(batch.txs.len()),
+            ..SchedulerProfileCounters::default()
+        },
+        timings: SchedulerProfileTimings::default(),
+    }
+}
+
+fn add_counter(
+    profile: &mut Option<SchedulerProfileRecord>,
+    update: impl FnOnce(&mut SchedulerProfileCounters),
+) {
+    if let Some(profile) = profile {
+        update(&mut profile.counters);
+    }
+}
+
+fn add_timing(
+    profile: &mut Option<SchedulerProfileRecord>,
+    update: impl FnOnce(&mut SchedulerProfileTimings),
+) {
+    if let Some(profile) = profile {
+        update(&mut profile.timings);
+    }
+}
+
+fn add_participant_counters(
+    profile: &mut Option<SchedulerProfileRecord>,
+    participants: &Participants,
+    shard_id: ShardId,
+) {
+    add_counter(profile, |counters| {
+        if participants.active.contains(&shard_id) {
+            counters.active_tx_count = counters.active_tx_count.saturating_add(1);
+        } else {
+            counters.passive_tx_count = counters.passive_tx_count.saturating_add(1);
+        }
+    });
+}
+
+fn merge_calvin_worker_profile(
+    profile: &mut Option<SchedulerProfileRecord>,
+    worker_profile: Option<CalvinWorkerProfile>,
+) {
+    let Some(worker_profile) = worker_profile else {
+        return;
+    };
+    let Some(profile) = profile else {
+        return;
+    };
+    profile.timings.lock_wait_sum_ns = profile
+        .timings
+        .lock_wait_sum_ns
+        .saturating_add(worker_profile.lock_wait_ns);
+    profile.timings.lock_wait_max_ns = profile
+        .timings
+        .lock_wait_max_ns
+        .max(worker_profile.lock_wait_ns);
+    profile.timings.local_read_ns = profile
+        .timings
+        .local_read_ns
+        .saturating_add(worker_profile.local_read_ns);
+    profile.timings.remote_read_send_ns = profile
+        .timings
+        .remote_read_send_ns
+        .saturating_add(worker_profile.remote_read_send_ns);
+    profile.timings.remote_read_collect_ns = profile
+        .timings
+        .remote_read_collect_ns
+        .saturating_add(worker_profile.remote_read_collect_ns);
+    profile.timings.execute_apply_ns = profile
+        .timings
+        .execute_apply_ns
+        .saturating_add(worker_profile.execute_apply_ns);
+    profile.timings.result_mark_ns = profile
+        .timings
+        .result_mark_ns
+        .saturating_add(worker_profile.result_mark_ns);
+    profile.counters.remote_read_messages_sent = profile
+        .counters
+        .remote_read_messages_sent
+        .saturating_add(worker_profile.remote_sent);
+    profile.counters.remote_read_messages_received = profile
+        .counters
+        .remote_read_messages_received
+        .saturating_add(worker_profile.remote_received);
+}
+
+fn merge_scc_worker_profile(
+    profile: &mut Option<SchedulerProfileRecord>,
+    worker_profile: Option<SccWorkerProfile>,
+) {
+    let Some(worker_profile) = worker_profile else {
+        return;
+    };
+    let Some(profile) = profile else {
+        return;
+    };
+    add_stage_sample(
+        &mut profile.timings.scc_effect_wait,
+        worker_profile.effect_wait_ns,
+    );
+    add_stage_sample(
+        &mut profile.timings.scc_effect_materialize,
+        worker_profile.effect_materialize_ns,
+    );
+    add_stage_sample(
+        &mut profile.timings.scc_effect_send,
+        worker_profile.effect_send_ns,
+    );
+    add_stage_sample(
+        &mut profile.timings.scc_effect_collect,
+        worker_profile.effect_collect_ns,
+    );
+    add_stage_sample(&mut profile.timings.scc_execute, worker_profile.execute_ns);
+    add_stage_sample(
+        &mut profile.timings.scc_delta_build,
+        worker_profile.delta_build_ns,
+    );
+    add_stage_sample(
+        &mut profile.timings.scc_condition_wait,
+        worker_profile.condition_wait_ns,
+    );
+    add_stage_sample(
+        &mut profile.timings.scc_condition_materialize,
+        worker_profile.condition_materialize_ns,
+    );
+    add_stage_sample(
+        &mut profile.timings.scc_condition_send,
+        worker_profile.condition_send_ns,
+    );
+    add_stage_sample(
+        &mut profile.timings.scc_condition_collect,
+        worker_profile.condition_collect_ns,
+    );
+    add_stage_sample(
+        &mut profile.timings.scc_condition_check,
+        worker_profile.condition_check_ns,
+    );
+    add_stage_sample(&mut profile.timings.scc_commit, worker_profile.commit_ns);
+    if worker_profile.condition_skipped {
+        profile.counters.condition_skipped_count =
+            profile.counters.condition_skipped_count.saturating_add(1);
+    }
+    profile.counters.delta_op_count = profile
+        .counters
+        .delta_op_count
+        .saturating_add(worker_profile.delta_op_count);
+    profile.counters.remote_read_messages_sent = profile
+        .counters
+        .remote_read_messages_sent
+        .saturating_add(worker_profile.remote_sent);
+    profile.counters.remote_read_messages_received = profile
+        .counters
+        .remote_read_messages_received
+        .saturating_add(worker_profile.remote_received);
+}
+
+fn add_stage_sample(stats: &mut WorkerStageStats, ns: u64) {
+    if ns > 0 {
+        stats.add_sample(ns);
+    }
+}
+
+fn dag_edge_count(dag: &SemanticDag) -> u64 {
+    dag.nodes
+        .iter()
+        .map(|node| usize_to_u64(node.successors.len()))
+        .fold(0u64, u64::saturating_add)
+}
+
+fn plan_pair_count(tx_count: usize) -> u64 {
+    let tx_count = usize_to_u64(tx_count);
+    tx_count.saturating_mul(tx_count.saturating_sub(1)) / 2
+}
+
+fn elapsed_ns(started: Instant) -> u64 {
+    let nanos = started.elapsed().as_nanos();
+    (nanos.min(u128::from(u64::MAX)) as u64).max(1)
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
 struct TxWorker {
     core: Arc<ShardCore>,
     batch_id: BatchId,
@@ -436,6 +912,7 @@ struct TxWorker {
     local_keys: BTreeSet<Key>,
     grant_rx: mpsc::Receiver<LockGrant>,
     remote_rx: Option<mpsc::Receiver<LocalReadResult>>,
+    profile_enabled: bool,
     outcome_tx: mpsc::Sender<WorkerOutcome>,
 }
 
@@ -446,8 +923,8 @@ struct WorkerOutcome {
 }
 
 enum WorkerCompletion {
-    Active(TxResultRecord),
-    Passive,
+    Active(TxResultRecord, Option<CalvinWorkerProfile>),
+    Passive(Option<CalvinWorkerProfile>),
 }
 
 fn spawn_tx_worker(worker: TxWorker) {
@@ -468,38 +945,70 @@ fn spawn_tx_worker(worker: TxWorker) {
 
 impl TxWorker {
     async fn run(mut self) -> Result<WorkerCompletion> {
+        let mut profile = self.profile_enabled.then(CalvinWorkerProfile::default);
+        let started = Instant::now();
         self.wait_for_lock_grants().await?;
+        if let Some(profile) = &mut profile {
+            profile.lock_wait_ns = elapsed_ns(started);
+        }
 
         let local_read_keys = self
             .core
             .layout
             .local_read_keys(&self.tx, self.core.shard_id);
+        let started = Instant::now();
         let local_reads = self.core.store.read_many(&local_read_keys)?;
-        self.send_local_reads(&local_reads).await?;
-
-        if !self.participants.active.contains(&self.core.shard_id) {
-            return Ok(WorkerCompletion::Passive);
+        if let Some(profile) = &mut profile {
+            profile.local_read_ns = elapsed_ns(started);
         }
 
-        let full_reads = self.collect_full_reads(local_reads).await?;
+        let started = Instant::now();
+        let sent = self.send_local_reads(&local_reads).await?;
+        if let Some(profile) = &mut profile {
+            profile.remote_read_send_ns = elapsed_ns(started);
+            profile.remote_sent = usize_to_u64(sent);
+        }
+
+        if !self.participants.active.contains(&self.core.shard_id) {
+            return Ok(WorkerCompletion::Passive(profile));
+        }
+
+        let started = Instant::now();
+        let (full_reads, received) = self.collect_full_reads(local_reads).await?;
+        if let Some(profile) = &mut profile {
+            profile.remote_read_collect_ns = elapsed_ns(started);
+            profile.remote_received = usize_to_u64(received);
+        }
+
+        let started = Instant::now();
         let output = execute_deterministic(&self.tx, &full_reads);
         let result = output.result;
         let local_writes =
             filter_local_writes(output.writes, self.core.shard_id, &self.core.layout);
         self.validate_local_writes(&local_writes)?;
         self.core.store.apply_writes_atomically(&local_writes)?;
+        if let Some(profile) = &mut profile {
+            profile.execute_apply_ns = elapsed_ns(started);
+        }
         if self.result_shard == self.core.shard_id {
+            let started = Instant::now();
             self.core
                 .client_results
                 .mark_ready(self.tx.tx_id, result)
                 .await;
+            if let Some(profile) = &mut profile {
+                profile.result_mark_ns = elapsed_ns(started);
+            }
         }
 
-        Ok(WorkerCompletion::Active(TxResultRecord {
-            tx_id: self.tx.tx_id,
-            shard_id: self.core.shard_id,
-            result,
-        }))
+        Ok(WorkerCompletion::Active(
+            TxResultRecord {
+                tx_id: self.tx.tx_id,
+                shard_id: self.core.shard_id,
+                result,
+            },
+            profile,
+        ))
     }
 
     async fn wait_for_lock_grants(&mut self) -> Result<()> {
@@ -527,7 +1036,8 @@ impl TxWorker {
         Ok(())
     }
 
-    async fn send_local_reads(&self, local_reads: &BTreeMap<Key, ReadValue>) -> Result<()> {
+    async fn send_local_reads(&self, local_reads: &BTreeMap<Key, ReadValue>) -> Result<usize> {
+        let mut sent = 0usize;
         for target in &self.participants.active {
             if *target == self.core.shard_id {
                 continue;
@@ -548,14 +1058,15 @@ impl TxWorker {
             };
             let mut client = pb::shard_client::ShardClient::connect(endpoint).await?;
             client.local_read_result(request).await?;
+            sent += 1;
         }
-        Ok(())
+        Ok(sent)
     }
 
     async fn collect_full_reads(
         &mut self,
         local_reads: BTreeMap<Key, ReadValue>,
-    ) -> Result<BTreeMap<Key, ReadValue>> {
+    ) -> Result<(BTreeMap<Key, ReadValue>, usize)> {
         let mut full_reads = local_reads;
         let expected_remote: BTreeSet<ShardId> = self
             .participants
@@ -637,7 +1148,7 @@ impl TxWorker {
             )));
         }
 
-        Ok(full_reads)
+        Ok((full_reads, received.len()))
     }
 
     fn validate_local_writes(&self, writes: &[crate::model::WriteOp]) -> Result<()> {
@@ -681,6 +1192,7 @@ struct SccWorker {
     waiters: TxDagWaiters,
     effect_rx: mpsc::Receiver<LocalReadResult>,
     condition_rx: mpsc::Receiver<LocalReadResult>,
+    profile: Option<SccWorkerProfile>,
     outcome_tx: mpsc::Sender<SccWorkerOutcome>,
 }
 
@@ -691,6 +1203,7 @@ struct SccWorkerOutcome {
 
 struct SccWorkerCompletion {
     record: Option<TxResultRecord>,
+    profile: Option<SccWorkerProfile>,
 }
 
 fn spawn_scc_worker(worker: SccWorker) {
@@ -704,34 +1217,72 @@ fn spawn_scc_worker(worker: SccWorker) {
 
 impl SccWorker {
     async fn run(mut self) -> Result<SccWorkerCompletion> {
+        let started = Instant::now();
         (&mut self.waiters.effect_ready).await.map_err(|_| {
             Error::ChannelClosed(format!(
                 "SCC effect DAG ready channel closed for tx {}",
                 self.tx.tx_id
             ))
         })?;
+        if let Some(profile) = &mut self.profile {
+            profile.effect_wait_ns = elapsed_ns(started);
+        }
 
+        let started = Instant::now();
         let effect_local_reads = match self.materialized_read(SccPhase::Effect).await {
-            Ok(reads) => reads,
+            Ok(reads) => {
+                if let Some(profile) = &mut self.profile {
+                    profile.effect_materialize_ns = elapsed_ns(started);
+                }
+                reads
+            }
             Err(Error::SpeculationFailed(reason)) => {
-                self.send_scc_status(ReadPhase::SccEffect, LocalReadStatus::SpeculationFailed)
+                if let Some(profile) = &mut self.profile {
+                    profile.effect_materialize_ns = elapsed_ns(started);
+                }
+                let started = Instant::now();
+                let sent = self
+                    .send_scc_status(ReadPhase::SccEffect, LocalReadStatus::SpeculationFailed)
                     .await?;
+                if let Some(profile) = &mut self.profile {
+                    profile.effect_send_ns = elapsed_ns(started);
+                    profile.remote_sent = profile.remote_sent.saturating_add(usize_to_u64(sent));
+                }
                 return self.fail(reason);
             }
             Err(err) => return Err(err),
         };
-        self.send_scc_reads(ReadPhase::SccEffect, &effect_local_reads)
+        let started = Instant::now();
+        let sent = self
+            .send_scc_reads(ReadPhase::SccEffect, &effect_local_reads)
             .await?;
+        if let Some(profile) = &mut self.profile {
+            profile.effect_send_ns = elapsed_ns(started);
+            profile.remote_sent = profile.remote_sent.saturating_add(usize_to_u64(sent));
+        }
+        let started = Instant::now();
         let effect_full_reads = match self
             .collect_scc_full_reads(effect_local_reads, ReadPhase::SccEffect)
             .await
         {
-            Ok(reads) => reads,
+            Ok((reads, received)) => {
+                if let Some(profile) = &mut self.profile {
+                    profile.effect_collect_ns = elapsed_ns(started);
+                    profile.remote_received = profile
+                        .remote_received
+                        .saturating_add(usize_to_u64(received));
+                }
+                reads
+            }
             Err(Error::SpeculationFailed(reason)) => return self.fail(reason),
             Err(err) => return Err(err),
         };
 
+        let started = Instant::now();
         let output = execute_deterministic(&self.tx, &effect_full_reads);
+        if let Some(profile) = &mut self.profile {
+            profile.execute_ns = elapsed_ns(started);
+        }
         if classify_actual_path(&self.tx, &output) != Some(self.tx_plan.predicted_path) {
             let reason = format!(
                 "tx {} actual result {:?} does not match predicted success path {:?}",
@@ -739,53 +1290,103 @@ impl SccWorker {
             );
             return self.fail(reason);
         }
+        let started = Instant::now();
         let full_delta = output_to_delta(&self.tx, &effect_full_reads, output)?;
         let local_delta = filter_delta_to_keys(&full_delta, &self.local_write_keys);
+        if let Some(profile) = &mut self.profile {
+            profile.delta_build_ns = elapsed_ns(started);
+            profile.delta_op_count = usize_to_u64(local_delta.ops.len());
+        }
 
+        let started = Instant::now();
         (&mut self.waiters.condition_ready).await.map_err(|_| {
             Error::ChannelClosed(format!(
                 "SCC condition DAG ready channel closed for tx {}",
                 self.tx.tx_id
             ))
         })?;
+        if let Some(profile) = &mut self.profile {
+            profile.condition_wait_ns = elapsed_ns(started);
+        }
 
         if self.tx_plan.effect_prefix_covers_condition() {
+            if let Some(profile) = &mut self.profile {
+                profile.condition_skipped = true;
+            }
             return self.commit_success(local_delta).await;
         }
 
+        let started = Instant::now();
         let condition_local_reads = match self.materialized_read(SccPhase::Condition).await {
-            Ok(reads) => reads,
+            Ok(reads) => {
+                if let Some(profile) = &mut self.profile {
+                    profile.condition_materialize_ns = elapsed_ns(started);
+                }
+                reads
+            }
             Err(Error::SpeculationFailed(reason)) => {
-                self.send_scc_status(ReadPhase::SccCondition, LocalReadStatus::SpeculationFailed)
+                if let Some(profile) = &mut self.profile {
+                    profile.condition_materialize_ns = elapsed_ns(started);
+                }
+                let started = Instant::now();
+                let sent = self
+                    .send_scc_status(ReadPhase::SccCondition, LocalReadStatus::SpeculationFailed)
                     .await?;
+                if let Some(profile) = &mut self.profile {
+                    profile.condition_send_ns = elapsed_ns(started);
+                    profile.remote_sent = profile.remote_sent.saturating_add(usize_to_u64(sent));
+                }
                 return self.fail(reason);
             }
             Err(err) => return Err(err),
         };
-        self.send_scc_reads(ReadPhase::SccCondition, &condition_local_reads)
+        let started = Instant::now();
+        let sent = self
+            .send_scc_reads(ReadPhase::SccCondition, &condition_local_reads)
             .await?;
+        if let Some(profile) = &mut self.profile {
+            profile.condition_send_ns = elapsed_ns(started);
+            profile.remote_sent = profile.remote_sent.saturating_add(usize_to_u64(sent));
+        }
+        let started = Instant::now();
         let condition_full_reads = match self
             .collect_scc_full_reads(condition_local_reads, ReadPhase::SccCondition)
             .await
         {
-            Ok(reads) => reads,
+            Ok((reads, received)) => {
+                if let Some(profile) = &mut self.profile {
+                    profile.condition_collect_ns = elapsed_ns(started);
+                    profile.remote_received = profile
+                        .remote_received
+                        .saturating_add(usize_to_u64(received));
+                }
+                reads
+            }
             Err(Error::SpeculationFailed(reason)) => return self.fail(reason),
             Err(err) => return Err(err),
         };
 
+        let started = Instant::now();
         if !check_success_path_condition(
             &self.tx,
             self.tx_plan.predicted_path,
             &condition_full_reads,
         )? {
+            if let Some(profile) = &mut self.profile {
+                profile.condition_check_ns = elapsed_ns(started);
+            }
             let reason = format!("tx {} success path condition failed", self.tx.tx_id);
             return self.fail(reason);
+        }
+        if let Some(profile) = &mut self.profile {
+            profile.condition_check_ns = elapsed_ns(started);
         }
 
         self.commit_success(local_delta).await
     }
 
-    async fn commit_success(&self, local_delta: TxDelta) -> Result<SccWorkerCompletion> {
+    async fn commit_success(mut self, local_delta: TxDelta) -> Result<SccWorkerCompletion> {
+        let started = Instant::now();
         if local_delta.ops.is_empty() {
             self.commit_seq
                 .set_terminal_once(self.tx_index, CommitSlotState::NoOp)?;
@@ -800,6 +1401,9 @@ impl SccWorker {
                 .mark_ready(self.tx.tx_id, TxResult::Ok)
                 .await;
         }
+        if let Some(profile) = &mut self.profile {
+            profile.commit_ns = elapsed_ns(started);
+        }
 
         let record = self
             .participants
@@ -810,7 +1414,10 @@ impl SccWorker {
                 shard_id: self.core.shard_id,
                 result: TxResult::Ok,
             });
-        Ok(SccWorkerCompletion { record })
+        Ok(SccWorkerCompletion {
+            record,
+            profile: self.profile,
+        })
     }
 
     async fn materialized_read(&self, phase: SccPhase) -> Result<BTreeMap<Key, ReadValue>> {
@@ -829,12 +1436,12 @@ impl SccWorker {
         &self,
         phase: ReadPhase,
         local_reads: &BTreeMap<Key, ReadValue>,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         self.send_scc_read_result(phase, LocalReadStatus::Ok, local_reads)
             .await
     }
 
-    async fn send_scc_status(&self, phase: ReadPhase, status: LocalReadStatus) -> Result<()> {
+    async fn send_scc_status(&self, phase: ReadPhase, status: LocalReadStatus) -> Result<usize> {
         self.send_scc_read_result(phase, status, &BTreeMap::new())
             .await
     }
@@ -844,7 +1451,8 @@ impl SccWorker {
         phase: ReadPhase,
         status: LocalReadStatus,
         local_reads: &BTreeMap<Key, ReadValue>,
-    ) -> Result<()> {
+    ) -> Result<usize> {
+        let mut sent = 0usize;
         for target in &self.participants.all {
             if *target == self.core.shard_id {
                 continue;
@@ -869,15 +1477,16 @@ impl SccWorker {
             };
             let mut client = pb::shard_client::ShardClient::connect(endpoint).await?;
             client.local_read_result(request).await?;
+            sent += 1;
         }
-        Ok(())
+        Ok(sent)
     }
 
     async fn collect_scc_full_reads(
         &mut self,
         local_reads: BTreeMap<Key, ReadValue>,
         phase: ReadPhase,
-    ) -> Result<BTreeMap<Key, ReadValue>> {
+    ) -> Result<(BTreeMap<Key, ReadValue>, usize)> {
         let mut full_reads = local_reads;
         let expected_remote: BTreeSet<ShardId> = self
             .participants
@@ -960,14 +1569,17 @@ impl SccWorker {
                 self.tx.tx_id, phase, self.tx.read_set, full_keys
             )));
         }
-        Ok(full_reads)
+        Ok((full_reads, received.len()))
     }
 
-    fn fail(self, reason: String) -> Result<SccWorkerCompletion> {
+    fn fail(mut self, reason: String) -> Result<SccWorkerCompletion> {
         self.commit_seq
             .set_terminal_once(self.tx_index, CommitSlotState::Failed)?;
         tracing::debug!("SCC tx {} failed speculation: {}", self.tx.tx_id, reason);
-        Ok(SccWorkerCompletion { record: None })
+        Ok(SccWorkerCompletion {
+            record: None,
+            profile: self.profile.take(),
+        })
     }
 }
 
@@ -1016,7 +1628,7 @@ async fn publish_scc_completion_report(
     core: Arc<ShardCore>,
     batch_id: BatchId,
     failed_tx_indices: BTreeSet<usize>,
-) -> Result<()> {
+) -> Result<usize> {
     core.scc_completion_reports
         .route(SccCompletionReport {
             batch_id,
@@ -1031,6 +1643,7 @@ async fn publish_scc_completion_report(
         .iter()
         .filter_map(|(peer, endpoint)| (*peer != from_shard).then_some(endpoint.clone()))
         .collect();
+    let report_count = peers.len() + 1;
     let mut handles = Vec::new();
     for endpoint in peers {
         let endpoint = endpoint.clone();
@@ -1056,14 +1669,19 @@ async fn publish_scc_completion_report(
             .await
             .map_err(|err| Error::TaskJoin(err.to_string()))??;
     }
-    Ok(())
+    Ok(report_count)
+}
+
+struct SccCompletionCollection {
+    failed_indices: BTreeSet<usize>,
+    report_count: usize,
 }
 
 async fn collect_scc_completion_reports(
     core: Arc<ShardCore>,
     batch_id: BatchId,
     completion_rx: &mut mpsc::Receiver<SccCompletionReport>,
-) -> Result<BTreeSet<usize>> {
+) -> Result<SccCompletionCollection> {
     let expected: BTreeSet<ShardId> = (0..core.layout.shard_count).collect();
     let mut reports: BTreeMap<ShardId, BTreeSet<usize>> = BTreeMap::new();
     while reports.len() < expected.len() {
@@ -1096,7 +1714,11 @@ async fn collect_scc_completion_reports(
         }
     }
 
-    Ok(reports.into_values().flatten().collect())
+    let report_count = reports.len();
+    Ok(SccCompletionCollection {
+        failed_indices: reports.into_values().flatten().collect(),
+        report_count,
+    })
 }
 
 fn install_scc_successes(

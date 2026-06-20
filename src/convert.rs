@@ -1,7 +1,8 @@
 use crate::error::{Error, Result};
 use crate::model::{
     Batch, FsOp, Inode, Key, LocalReadStatus, NodeKind, OrderedTx, ReadPhase, ReadValue,
-    SccReorderRecord, TxResult, TxResultRecord,
+    SccReorderRecord, SchedulerProfileCounters, SchedulerProfileRecord, SchedulerProfileScheduler,
+    SchedulerProfileTimings, TxResult, TxResultRecord, WorkerStageStats,
 };
 use crate::proto::pb;
 use std::collections::{BTreeMap, BTreeSet};
@@ -242,6 +243,223 @@ pub fn scc_reorder_records_from_proto(values: Vec<pb::SccReorderRecord>) -> Vec<
         .into_iter()
         .map(scc_reorder_record_from_proto)
         .collect()
+}
+
+pub fn scheduler_profile_record_to_proto(
+    value: &SchedulerProfileRecord,
+) -> pb::SchedulerProfileRecord {
+    pb::SchedulerProfileRecord {
+        scheduler: scheduler_profile_scheduler_to_i32(value.scheduler),
+        batch_id: value.batch_id,
+        shard_id: value.shard_id,
+        counters: Some(scheduler_profile_counters_to_proto(&value.counters)),
+        timings: Some(scheduler_profile_timings_to_proto(&value.timings)),
+    }
+}
+
+pub fn scheduler_profile_record_from_proto(
+    value: pb::SchedulerProfileRecord,
+) -> Result<SchedulerProfileRecord> {
+    Ok(SchedulerProfileRecord {
+        scheduler: scheduler_profile_scheduler_from_i32(value.scheduler)?,
+        batch_id: value.batch_id,
+        shard_id: value.shard_id,
+        counters: scheduler_profile_counters_from_proto(value.counters.unwrap_or_default()),
+        timings: scheduler_profile_timings_from_proto(value.timings.unwrap_or_default()),
+    })
+}
+
+pub fn scheduler_profile_records_to_proto(
+    values: &[SchedulerProfileRecord],
+) -> Vec<pb::SchedulerProfileRecord> {
+    values
+        .iter()
+        .map(scheduler_profile_record_to_proto)
+        .collect()
+}
+
+pub fn scheduler_profile_records_from_proto(
+    values: Vec<pb::SchedulerProfileRecord>,
+) -> Result<Vec<SchedulerProfileRecord>> {
+    values
+        .into_iter()
+        .map(scheduler_profile_record_from_proto)
+        .collect()
+}
+
+fn scheduler_profile_counters_to_proto(
+    value: &SchedulerProfileCounters,
+) -> pb::SchedulerProfileCounters {
+    pb::SchedulerProfileCounters {
+        tx_count: value.tx_count,
+        relevant_tx_count: value.relevant_tx_count,
+        active_tx_count: value.active_tx_count,
+        passive_tx_count: value.passive_tx_count,
+        non_participant_tx_count: value.non_participant_tx_count,
+        local_read_key_count: value.local_read_key_count,
+        local_write_key_count: value.local_write_key_count,
+        remote_read_messages_sent: value.remote_read_messages_sent,
+        remote_read_messages_received: value.remote_read_messages_received,
+        result_records_produced: value.result_records_produced,
+        lock_key_count: value.lock_key_count,
+        plan_pair_count: value.plan_pair_count,
+        effect_edge_count: value.effect_edge_count,
+        condition_edge_count: value.condition_edge_count,
+        condition_skipped_count: value.condition_skipped_count,
+        speculative_success_count: value.speculative_success_count,
+        local_failed_count: value.local_failed_count,
+        global_failed_count: value.global_failed_count,
+        fallback_tx_count: value.fallback_tx_count,
+        delta_op_count: value.delta_op_count,
+        completion_reports_sent: value.completion_reports_sent,
+        completion_reports_received: value.completion_reports_received,
+    }
+}
+
+fn scheduler_profile_counters_from_proto(
+    value: pb::SchedulerProfileCounters,
+) -> SchedulerProfileCounters {
+    SchedulerProfileCounters {
+        tx_count: value.tx_count,
+        relevant_tx_count: value.relevant_tx_count,
+        active_tx_count: value.active_tx_count,
+        passive_tx_count: value.passive_tx_count,
+        non_participant_tx_count: value.non_participant_tx_count,
+        local_read_key_count: value.local_read_key_count,
+        local_write_key_count: value.local_write_key_count,
+        remote_read_messages_sent: value.remote_read_messages_sent,
+        remote_read_messages_received: value.remote_read_messages_received,
+        result_records_produced: value.result_records_produced,
+        lock_key_count: value.lock_key_count,
+        plan_pair_count: value.plan_pair_count,
+        effect_edge_count: value.effect_edge_count,
+        condition_edge_count: value.condition_edge_count,
+        condition_skipped_count: value.condition_skipped_count,
+        speculative_success_count: value.speculative_success_count,
+        local_failed_count: value.local_failed_count,
+        global_failed_count: value.global_failed_count,
+        fallback_tx_count: value.fallback_tx_count,
+        delta_op_count: value.delta_op_count,
+        completion_reports_sent: value.completion_reports_sent,
+        completion_reports_received: value.completion_reports_received,
+    }
+}
+
+fn scheduler_profile_timings_to_proto(
+    value: &SchedulerProfileTimings,
+) -> pb::SchedulerProfileTimings {
+    pb::SchedulerProfileTimings {
+        total_ns: value.total_ns,
+        cleanup_ns: value.cleanup_ns,
+        validate_ns: value.validate_ns,
+        result_registry_ns: value.result_registry_ns,
+        lock_wait_sum_ns: value.lock_wait_sum_ns,
+        lock_wait_max_ns: value.lock_wait_max_ns,
+        local_read_ns: value.local_read_ns,
+        remote_read_send_ns: value.remote_read_send_ns,
+        remote_read_collect_ns: value.remote_read_collect_ns,
+        execute_apply_ns: value.execute_apply_ns,
+        result_mark_ns: value.result_mark_ns,
+        outcome_collect_release_ns: value.outcome_collect_release_ns,
+        plan_build_ns: value.plan_build_ns,
+        dag_setup_ns: value.dag_setup_ns,
+        base_read_ns: value.base_read_ns,
+        mailbox_spawn_ns: value.mailbox_spawn_ns,
+        completion_publish_ns: value.completion_publish_ns,
+        completion_collect_ns: value.completion_collect_ns,
+        record_reorder_ns: value.record_reorder_ns,
+        install_successes_ns: value.install_successes_ns,
+        fallback_ns: value.fallback_ns,
+        scc_effect_wait: Some(worker_stage_stats_to_proto(&value.scc_effect_wait)),
+        scc_effect_materialize: Some(worker_stage_stats_to_proto(&value.scc_effect_materialize)),
+        scc_effect_send: Some(worker_stage_stats_to_proto(&value.scc_effect_send)),
+        scc_effect_collect: Some(worker_stage_stats_to_proto(&value.scc_effect_collect)),
+        scc_execute: Some(worker_stage_stats_to_proto(&value.scc_execute)),
+        scc_delta_build: Some(worker_stage_stats_to_proto(&value.scc_delta_build)),
+        scc_condition_wait: Some(worker_stage_stats_to_proto(&value.scc_condition_wait)),
+        scc_condition_materialize: Some(worker_stage_stats_to_proto(
+            &value.scc_condition_materialize,
+        )),
+        scc_condition_send: Some(worker_stage_stats_to_proto(&value.scc_condition_send)),
+        scc_condition_collect: Some(worker_stage_stats_to_proto(&value.scc_condition_collect)),
+        scc_condition_check: Some(worker_stage_stats_to_proto(&value.scc_condition_check)),
+        scc_commit: Some(worker_stage_stats_to_proto(&value.scc_commit)),
+    }
+}
+
+fn scheduler_profile_timings_from_proto(
+    value: pb::SchedulerProfileTimings,
+) -> SchedulerProfileTimings {
+    SchedulerProfileTimings {
+        total_ns: value.total_ns,
+        cleanup_ns: value.cleanup_ns,
+        validate_ns: value.validate_ns,
+        result_registry_ns: value.result_registry_ns,
+        lock_wait_sum_ns: value.lock_wait_sum_ns,
+        lock_wait_max_ns: value.lock_wait_max_ns,
+        local_read_ns: value.local_read_ns,
+        remote_read_send_ns: value.remote_read_send_ns,
+        remote_read_collect_ns: value.remote_read_collect_ns,
+        execute_apply_ns: value.execute_apply_ns,
+        result_mark_ns: value.result_mark_ns,
+        outcome_collect_release_ns: value.outcome_collect_release_ns,
+        plan_build_ns: value.plan_build_ns,
+        dag_setup_ns: value.dag_setup_ns,
+        base_read_ns: value.base_read_ns,
+        mailbox_spawn_ns: value.mailbox_spawn_ns,
+        completion_publish_ns: value.completion_publish_ns,
+        completion_collect_ns: value.completion_collect_ns,
+        record_reorder_ns: value.record_reorder_ns,
+        install_successes_ns: value.install_successes_ns,
+        fallback_ns: value.fallback_ns,
+        scc_effect_wait: worker_stage_stats_from_proto(value.scc_effect_wait),
+        scc_effect_materialize: worker_stage_stats_from_proto(value.scc_effect_materialize),
+        scc_effect_send: worker_stage_stats_from_proto(value.scc_effect_send),
+        scc_effect_collect: worker_stage_stats_from_proto(value.scc_effect_collect),
+        scc_execute: worker_stage_stats_from_proto(value.scc_execute),
+        scc_delta_build: worker_stage_stats_from_proto(value.scc_delta_build),
+        scc_condition_wait: worker_stage_stats_from_proto(value.scc_condition_wait),
+        scc_condition_materialize: worker_stage_stats_from_proto(value.scc_condition_materialize),
+        scc_condition_send: worker_stage_stats_from_proto(value.scc_condition_send),
+        scc_condition_collect: worker_stage_stats_from_proto(value.scc_condition_collect),
+        scc_condition_check: worker_stage_stats_from_proto(value.scc_condition_check),
+        scc_commit: worker_stage_stats_from_proto(value.scc_commit),
+    }
+}
+
+fn worker_stage_stats_to_proto(value: &WorkerStageStats) -> pb::WorkerStageStats {
+    pb::WorkerStageStats {
+        sum_ns: value.sum_ns,
+        max_ns: value.max_ns,
+    }
+}
+
+fn worker_stage_stats_from_proto(value: Option<pb::WorkerStageStats>) -> WorkerStageStats {
+    let value = value.unwrap_or_default();
+    WorkerStageStats {
+        sum_ns: value.sum_ns,
+        max_ns: value.max_ns,
+    }
+}
+
+pub fn scheduler_profile_scheduler_to_i32(value: SchedulerProfileScheduler) -> i32 {
+    match value {
+        SchedulerProfileScheduler::CalvinLocking => 1,
+        SchedulerProfileScheduler::SccOnline => 2,
+    }
+}
+
+pub fn scheduler_profile_scheduler_from_i32(value: i32) -> Result<SchedulerProfileScheduler> {
+    Ok(match value {
+        1 => SchedulerProfileScheduler::CalvinLocking,
+        2 => SchedulerProfileScheduler::SccOnline,
+        _ => {
+            return Err(Error::InvalidProto(format!(
+                "invalid SchedulerProfileScheduler {}",
+                value
+            )))
+        }
+    })
 }
 
 pub fn tx_result_to_i32(value: TxResult) -> i32 {

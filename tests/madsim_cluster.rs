@@ -6,20 +6,24 @@ use calvinfs_demo::checker::{
     merge_shard_states, reference_execute_batches, reference_execute_scc_reordered_batches,
 };
 use calvinfs_demo::convert::{
-    fs_op_to_proto, inode_entries_from_proto, scc_reorder_records_from_proto, tx_result_from_i32,
-    tx_result_records_from_proto,
+    fs_op_to_proto, inode_entries_from_proto, scc_reorder_records_from_proto,
+    scheduler_profile_records_from_proto, tx_result_from_i32, tx_result_records_from_proto,
 };
 use calvinfs_demo::engine::{
     SchedulerKind, SequencerConfig, SequencerRuntime, ShardConfig, ShardRuntime,
 };
 use calvinfs_demo::executor::derive_read_write_set;
-use calvinfs_demo::model::{Batch, FsOp, Key, OrderedTx, ShardId, TxResult, TxResultRecord};
+use calvinfs_demo::model::{
+    Batch, FsOp, Key, OrderedTx, SchedulerProfileRecord, SchedulerProfileScheduler, ShardId,
+    TxResult, TxResultRecord,
+};
 use calvinfs_demo::proto::pb;
 use calvinfs_demo::router::ShardLayout;
 use calvinfs_demo::service::{sequencer_service, shard_service};
 use calvinfs_demo::workload::metadata_workload;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
+use std::ffi::OsString;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -201,6 +205,35 @@ async fn scc_mixed_metadata_success_batch() -> Result<()> {
         ))
         .await
         .expect("scc mixed driver task panicked")?;
+
+    Ok(())
+}
+
+#[madsim::test]
+async fn scheduler_profiles_dump_state() -> Result<()> {
+    {
+        let _guard = EnvVarGuard::remove("CALVINFS_SCHED_PROFILE");
+        let disabled_profiles =
+            run_scheduler_profile_cluster(BenchmarkScheduler::Calvin, 59).await?;
+        if !disabled_profiles.is_empty() {
+            bail!(
+                "expected no scheduler profiles with CALVINFS_SCHED_PROFILE unset, got {}",
+                disabled_profiles.len()
+            );
+        }
+    }
+
+    let _guard = EnvVarGuard::set("CALVINFS_SCHED_PROFILE", "1");
+
+    let calvin_profiles = run_scheduler_profile_cluster(BenchmarkScheduler::Calvin, 60).await?;
+    assert_profile_batch(
+        &calvin_profiles,
+        SchedulerProfileScheduler::CalvinLocking,
+        0,
+    )?;
+
+    let scc_profiles = run_scheduler_profile_cluster(BenchmarkScheduler::Scc, 61).await?;
+    assert_profile_batch(&scc_profiles, SchedulerProfileScheduler::SccOnline, 1)?;
 
     Ok(())
 }
@@ -820,6 +853,148 @@ async fn run_mdtest_like_cluster(
         .expect("mdtest-like driver task panicked")
 }
 
+async fn run_scheduler_profile_cluster(
+    scheduler: BenchmarkScheduler,
+    network: u8,
+) -> Result<Vec<SchedulerProfileRecord>> {
+    let mut shard_endpoints = BTreeMap::new();
+    for shard_id in 0..SHARD_COUNT {
+        let ip = mdtest_shard_ip(network, shard_id);
+        shard_endpoints.insert(shard_id, endpoint(ip, SHARD_PORT));
+    }
+    for shard_id in 0..SHARD_COUNT {
+        let ip = mdtest_shard_ip(network, shard_id);
+        start_shard_node_with_name(
+            format!("profile-{}-shard-{shard_id}", scheduler.name()),
+            shard_id,
+            ip,
+            shard_endpoints.clone(),
+            scheduler.scheduler_kind(),
+        );
+    }
+
+    let sequencer_ip = mdtest_node_ip(network, 100);
+    let sequencer_endpoint = endpoint(sequencer_ip, SEQUENCER_PORT);
+    start_sequencer_node_with_config_and_name(
+        format!("profile-{}-sequencer", scheduler.name()),
+        sequencer_ip,
+        shard_endpoints.clone(),
+        BATCH_SIZE,
+        SequencerConfig::default_batch_flush_interval(),
+    );
+
+    let driver = madsim::runtime::Handle::current()
+        .create_node()
+        .name(format!("profile-{}-driver", scheduler.name()))
+        .ip(mdtest_node_ip(network, 200))
+        .build();
+    driver
+        .spawn(run_scheduler_profile_driver(
+            sequencer_endpoint,
+            shard_endpoints,
+        ))
+        .await
+        .expect("scheduler profile driver task panicked")
+}
+
+async fn run_scheduler_profile_driver(
+    sequencer_endpoint: String,
+    shard_endpoints: BTreeMap<ShardId, String>,
+) -> Result<Vec<SchedulerProfileRecord>> {
+    wait_for_shards(&shard_endpoints).await?;
+    wait_for_sequencer(&sequencer_endpoint).await?;
+
+    let mut sequencer = pb::sequencer_client::SequencerClient::connect(sequencer_endpoint).await?;
+    submit_client_tx(
+        &mut sequencer,
+        &shard_endpoints,
+        "profile:mkdir_root",
+        mkdir("/")?,
+        TxResult::Ok,
+    )
+    .await?;
+    submit_client_tx(
+        &mut sequencer,
+        &shard_endpoints,
+        "profile:mkdir_parent",
+        mkdir("/profile")?,
+        TxResult::Ok,
+    )
+    .await?;
+
+    let mut reference_batches = Vec::new();
+    let mut all_records = Vec::new();
+    submit_expected_batch(
+        &mut sequencer,
+        vec![
+            expect("profile:create_a", create("/profile/a")?, TxResult::Ok),
+            expect("profile:create_b", create("/profile/b")?, TxResult::Ok),
+        ],
+        &mut reference_batches,
+        &mut all_records,
+    )
+    .await?;
+    let target_batch_id = reference_batches
+        .last()
+        .expect("profile workload should submit a batch")
+        .batch_id;
+
+    let mut seen = BTreeSet::new();
+    let mut profiles = collect_new_scheduler_profiles(&shard_endpoints, &mut seen).await?;
+    profiles.retain(|profile| profile.batch_id == target_batch_id);
+    Ok(profiles)
+}
+
+fn assert_profile_batch(
+    profiles: &[SchedulerProfileRecord],
+    scheduler: SchedulerProfileScheduler,
+    expected_plan_pair_count: u64,
+) -> Result<()> {
+    if profiles.len() != SHARD_COUNT as usize {
+        bail!(
+            "expected {} profile records, got {}",
+            SHARD_COUNT,
+            profiles.len()
+        );
+    }
+    for profile in profiles {
+        if profile.scheduler != scheduler {
+            bail!(
+                "profile batch {} shard {} expected scheduler {:?}, got {:?}",
+                profile.batch_id,
+                profile.shard_id,
+                scheduler,
+                profile.scheduler
+            );
+        }
+        if profile.counters.tx_count != 2 {
+            bail!(
+                "profile batch {} shard {} expected tx_count=2, got {}",
+                profile.batch_id,
+                profile.shard_id,
+                profile.counters.tx_count
+            );
+        }
+        if profile.timings.total_ns == 0 {
+            bail!(
+                "profile batch {} shard {} has zero total_ns",
+                profile.batch_id,
+                profile.shard_id
+            );
+        }
+        if profile.counters.plan_pair_count != expected_plan_pair_count {
+            bail!(
+                "profile batch {} shard {} expected plan_pair_count={}, got {}",
+                profile.batch_id,
+                profile.shard_id,
+                expected_plan_pair_count,
+                profile.counters.plan_pair_count
+            );
+        }
+    }
+    Ok(())
+}
+
 async fn run_mdtest_like_client_driver(
     scheduler: BenchmarkScheduler,
     mode: MdtestMode,
@@ -928,6 +1103,7 @@ struct MdtestConfig {
     files_per_client: usize,
     batch_size: usize,
     show_ranks: bool,
+    scheduler_profile: bool,
 }
 
 impl MdtestConfig {
@@ -947,6 +1123,7 @@ impl MdtestConfig {
             )?,
             batch_size: read_positive_usize_env("CALVINFS_MDTEST_BATCH_SIZE", BATCH_SIZE)?,
             show_ranks: read_bool_env("CALVINFS_MDTEST_SHOW_RANKS", false)?,
+            scheduler_profile: read_bool_env("CALVINFS_SCHED_PROFILE", false)?,
         })
     }
 }
@@ -1053,6 +1230,7 @@ struct RankPhaseResult {
 struct PhaseSummary {
     phase: MdtestPhase,
     ranks: Vec<RankPhaseResult>,
+    profiles: Vec<SchedulerProfileRecord>,
     aggregate_ops_per_sec: f64,
     aggregate_ms_per_op: f64,
 }
@@ -1071,6 +1249,35 @@ struct FloatStats {
     mean: f64,
 }
 
+struct EnvVarGuard {
+    name: &'static str,
+    previous: Option<OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(name: &'static str, value: &str) -> Self {
+        let previous = env::var_os(name);
+        env::set_var(name, value);
+        Self { name, previous }
+    }
+
+    fn remove(name: &'static str) -> Self {
+        let previous = env::var_os(name);
+        env::remove_var(name);
+        Self { name, previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        if let Some(previous) = &self.previous {
+            env::set_var(self.name, previous);
+        } else {
+            env::remove_var(self.name);
+        }
+    }
+}
+
 async fn run_mdtest_mode(
     scheduler: BenchmarkScheduler,
     mode: MdtestMode,
@@ -1081,12 +1288,21 @@ async fn run_mdtest_mode(
     let mut sequencer =
         pb::sequencer_client::SequencerClient::connect(sequencer_endpoint.to_string()).await?;
     setup_mdtest_mode(&mut sequencer, shard_endpoints, mode, config).await?;
+    let mut seen_profile_keys = BTreeSet::new();
+    if config.scheduler_profile {
+        let _ = collect_new_scheduler_profiles(shard_endpoints, &mut seen_profile_keys).await?;
+    }
 
     let mut phases = Vec::new();
     for phase in MdtestPhase::all() {
         let ranks =
             run_mdtest_phase(phase, mode, config, sequencer_endpoint, shard_endpoints).await?;
-        phases.push(PhaseSummary::new(phase, ranks));
+        let profiles = if config.scheduler_profile {
+            collect_new_scheduler_profiles(shard_endpoints, &mut seen_profile_keys).await?
+        } else {
+            Vec::new()
+        };
+        phases.push(PhaseSummary::new(phase, ranks, profiles));
     }
 
     cleanup_mdtest_mode(&mut sequencer, shard_endpoints, mode, config).await?;
@@ -1388,8 +1604,33 @@ async fn connect_shard_clients(
     Ok(clients)
 }
 
+async fn collect_new_scheduler_profiles(
+    shard_endpoints: &BTreeMap<ShardId, String>,
+    seen: &mut BTreeSet<(ShardId, u64)>,
+) -> Result<Vec<SchedulerProfileRecord>> {
+    let mut profiles = Vec::new();
+    for endpoint in shard_endpoints.values() {
+        let mut shard = pb::shard_client::ShardClient::connect(endpoint.clone()).await?;
+        let response = shard
+            .dump_state(pb::DumpStateRequest {})
+            .await?
+            .into_inner();
+        for profile in scheduler_profile_records_from_proto(response.scheduler_profiles)? {
+            if seen.insert((profile.shard_id, profile.batch_id)) {
+                profiles.push(profile);
+            }
+        }
+    }
+    profiles.sort_by_key(|profile| (profile.batch_id, profile.shard_id));
+    Ok(profiles)
+}
+
 impl PhaseSummary {
-    fn new(phase: MdtestPhase, ranks: Vec<RankPhaseResult>) -> Self {
+    fn new(
+        phase: MdtestPhase,
+        ranks: Vec<RankPhaseResult>,
+        profiles: Vec<SchedulerProfileRecord>,
+    ) -> Self {
         let total_items: usize = ranks.iter().map(|rank| rank.items).sum();
         let max_time = ranks
             .iter()
@@ -1408,6 +1649,7 @@ impl PhaseSummary {
         Self {
             phase,
             ranks,
+            profiles,
             aggregate_ops_per_sec,
             aggregate_ms_per_op,
         }
@@ -1487,6 +1729,8 @@ fn print_mode_summary(summary: &ModeSummary, show_ranks: bool) {
         );
     }
 
+    print_scheduler_profile_summary(summary);
+
     if show_ranks {
         println!(
             "\n{} {} mode per-rank details:",
@@ -1511,6 +1755,200 @@ fn print_mode_summary(summary: &ModeSummary, show_ranks: bool) {
             }
         }
     }
+}
+
+fn print_scheduler_profile_summary(summary: &ModeSummary) {
+    if summary.phases.iter().all(|phase| phase.profiles.is_empty()) {
+        return;
+    }
+
+    println!(
+        "\n{} {} mode scheduler profile:",
+        summary.scheduler.display_name(),
+        summary.mode.name().to_uppercase()
+    );
+    println!(
+        "{:<22} {:>7} {:>12} {:>46} {:>10} {:>13} {:>10}",
+        "Operation", "Records", "Total ms", "Top stages", "Edges", "Remote msgs", "Fallback"
+    );
+    for phase in &summary.phases {
+        if phase.profiles.is_empty() {
+            continue;
+        }
+        let total_ns = sum_profile_stage(&phase.profiles, |profile| profile.timings.total_ns);
+        let edge_count = sum_profile_counter(&phase.profiles, |profile| {
+            profile
+                .counters
+                .effect_edge_count
+                .saturating_add(profile.counters.condition_edge_count)
+        });
+        let remote_messages = sum_profile_counter(&phase.profiles, |profile| {
+            profile
+                .counters
+                .remote_read_messages_sent
+                .saturating_add(profile.counters.remote_read_messages_received)
+        });
+        let fallback_tx = sum_profile_counter(&phase.profiles, |profile| {
+            profile.counters.fallback_tx_count
+        });
+        println!(
+            "{:<22} {:>7} {:>12.3} {:>46} {:>10} {:>13} {:>10}",
+            phase.phase.name(),
+            phase.profiles.len(),
+            ns_to_ms(total_ns),
+            top_profile_stages(&phase.profiles),
+            edge_count,
+            remote_messages,
+            fallback_tx
+        );
+    }
+}
+
+fn top_profile_stages(profiles: &[SchedulerProfileRecord]) -> String {
+    let mut stages = vec![
+        (
+            "validate",
+            sum_profile_stage(profiles, |p| p.timings.validate_ns),
+        ),
+        (
+            "result_registry",
+            sum_profile_stage(profiles, |p| p.timings.result_registry_ns),
+        ),
+        (
+            "lock_wait",
+            sum_profile_stage(profiles, |p| p.timings.lock_wait_sum_ns),
+        ),
+        (
+            "local_read",
+            sum_profile_stage(profiles, |p| p.timings.local_read_ns),
+        ),
+        (
+            "remote_send",
+            sum_profile_stage(profiles, |p| p.timings.remote_read_send_ns),
+        ),
+        (
+            "remote_collect",
+            sum_profile_stage(profiles, |p| p.timings.remote_read_collect_ns),
+        ),
+        (
+            "execute_apply",
+            sum_profile_stage(profiles, |p| p.timings.execute_apply_ns),
+        ),
+        (
+            "outcome",
+            sum_profile_stage(profiles, |p| p.timings.outcome_collect_release_ns),
+        ),
+        (
+            "plan_build",
+            sum_profile_stage(profiles, |p| p.timings.plan_build_ns),
+        ),
+        (
+            "dag",
+            sum_profile_stage(profiles, |p| p.timings.dag_setup_ns),
+        ),
+        (
+            "base_read",
+            sum_profile_stage(profiles, |p| p.timings.base_read_ns),
+        ),
+        (
+            "mailbox",
+            sum_profile_stage(profiles, |p| p.timings.mailbox_spawn_ns),
+        ),
+        (
+            "effect_wait",
+            sum_profile_stage(profiles, |p| p.timings.scc_effect_wait.sum_ns),
+        ),
+        (
+            "effect_mat",
+            sum_profile_stage(profiles, |p| p.timings.scc_effect_materialize.sum_ns),
+        ),
+        (
+            "effect_send",
+            sum_profile_stage(profiles, |p| p.timings.scc_effect_send.sum_ns),
+        ),
+        (
+            "effect_collect",
+            sum_profile_stage(profiles, |p| p.timings.scc_effect_collect.sum_ns),
+        ),
+        (
+            "scc_execute",
+            sum_profile_stage(profiles, |p| p.timings.scc_execute.sum_ns),
+        ),
+        (
+            "delta",
+            sum_profile_stage(profiles, |p| p.timings.scc_delta_build.sum_ns),
+        ),
+        (
+            "condition_wait",
+            sum_profile_stage(profiles, |p| p.timings.scc_condition_wait.sum_ns),
+        ),
+        (
+            "condition_mat",
+            sum_profile_stage(profiles, |p| p.timings.scc_condition_materialize.sum_ns),
+        ),
+        (
+            "condition_send",
+            sum_profile_stage(profiles, |p| p.timings.scc_condition_send.sum_ns),
+        ),
+        (
+            "condition_collect",
+            sum_profile_stage(profiles, |p| p.timings.scc_condition_collect.sum_ns),
+        ),
+        (
+            "condition_check",
+            sum_profile_stage(profiles, |p| p.timings.scc_condition_check.sum_ns),
+        ),
+        (
+            "commit",
+            sum_profile_stage(profiles, |p| p.timings.scc_commit.sum_ns),
+        ),
+        (
+            "completion_pub",
+            sum_profile_stage(profiles, |p| p.timings.completion_publish_ns),
+        ),
+        (
+            "completion_collect",
+            sum_profile_stage(profiles, |p| p.timings.completion_collect_ns),
+        ),
+        (
+            "install",
+            sum_profile_stage(profiles, |p| p.timings.install_successes_ns),
+        ),
+        (
+            "fallback",
+            sum_profile_stage(profiles, |p| p.timings.fallback_ns),
+        ),
+    ];
+    stages.sort_by_key(|(_, ns)| std::cmp::Reverse(*ns));
+    let parts: Vec<String> = stages
+        .into_iter()
+        .filter(|(_, ns)| *ns > 0)
+        .take(3)
+        .map(|(name, ns)| format!("{name}={:.3}ms", ns_to_ms(ns)))
+        .collect();
+    if parts.is_empty() {
+        "n/a".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
+fn sum_profile_stage(
+    profiles: &[SchedulerProfileRecord],
+    f: impl Fn(&SchedulerProfileRecord) -> u64,
+) -> u64 {
+    profiles.iter().map(f).fold(0u64, u64::saturating_add)
+}
+
+fn sum_profile_counter(
+    profiles: &[SchedulerProfileRecord],
+    f: impl Fn(&SchedulerProfileRecord) -> u64,
+) -> u64 {
+    profiles.iter().map(f).fold(0u64, u64::saturating_add)
+}
+
+fn ns_to_ms(ns: u64) -> f64 {
+    ns as f64 / 1_000_000.0
 }
 
 fn print_summary_row(
