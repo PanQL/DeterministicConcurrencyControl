@@ -37,6 +37,12 @@ const MDTEST_DEFAULT_DIRS_PER_CLIENT: usize = 4;
 const MDTEST_DEFAULT_FILES_PER_CLIENT: usize = 64;
 const MDTEST_PRIVATE_ROOT: &str = "/mdtest_private";
 const MDTEST_PUBLIC_ROOT: &str = "/mdtest_public";
+const MDWB_DEFAULT_CLIENT_COUNT: usize = 8;
+const MDWB_DEFAULT_DATA_SET_COUNT: usize = 4;
+const MDWB_DEFAULT_PRECREATE_PER_SET: usize = 8;
+const MDWB_DEFAULT_OPS_PER_SET: usize = 8;
+const MDWB_DEFAULT_ITERATIONS: usize = 1;
+const MDWB_ROOT: &str = "/mdwb";
 const SHARD_PORT: u16 = 50_051;
 const SEQUENCER_PORT: u16 = 50_052;
 
@@ -280,6 +286,48 @@ async fn mdtest_like_client_workload() -> Result<()> {
         &calvin_public_summary,
         &scc_public_summary,
     );
+
+    Ok(())
+}
+
+#[madsim::test]
+async fn md_workbench_like_client_workload() -> Result<()> {
+    let config = MdwbConfig::from_env()?;
+    let scenarios = config.scenarios();
+    println!(
+        "\nCalvinFS md-workbench-like workload: clients={} data_sets={} precreate/set={} ops/set={} iterations={} batch_size={}",
+        config.client_count,
+        config.data_set_count,
+        config.precreate_per_set,
+        config.ops_per_set,
+        config.iterations,
+        config.batch_size
+    );
+    println!(
+        "md-workbench-like scenarios: {}",
+        scenarios
+            .iter()
+            .map(MdwbScenario::name)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    let mut summaries = Vec::new();
+    let mut network = 70u8;
+    for scenario in scenarios {
+        for scheduler in [BenchmarkScheduler::Calvin, BenchmarkScheduler::Scc] {
+            summaries
+                .push(run_mdwb_like_cluster(scheduler, scenario, config.clone(), network).await?);
+            network = network
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("too many md-workbench scenarios"))?;
+        }
+    }
+
+    for summary in &summaries {
+        print_mdwb_summary(summary, config.show_ranks);
+    }
+    print_mdwb_scheduler_comparison(&summaries)?;
 
     Ok(())
 }
@@ -1326,6 +1374,911 @@ impl Drop for EnvVarGuard {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MdwbScenario {
+    PrivateOffset { offset: usize },
+    ParentBuckets { parent_count: usize },
+}
+
+impl MdwbScenario {
+    fn name(&self) -> String {
+        match self {
+            Self::PrivateOffset { offset } => format!("private_offset_{offset}"),
+            Self::ParentBuckets { parent_count } => format!("parent_buckets_{parent_count}"),
+        }
+    }
+
+    fn mode_name(&self) -> &'static str {
+        match self {
+            Self::PrivateOffset { .. } => "offset-scan",
+            Self::ParentBuckets { .. } => "bucket-hotness",
+        }
+    }
+
+    fn root(&self) -> String {
+        format!("{MDWB_ROOT}/{}", self.name())
+    }
+}
+
+#[derive(Clone, Debug)]
+struct MdwbConfig {
+    client_count: usize,
+    data_set_count: usize,
+    precreate_per_set: usize,
+    ops_per_set: usize,
+    iterations: usize,
+    batch_size: usize,
+    private_offsets: Vec<usize>,
+    parent_buckets: Vec<usize>,
+    show_ranks: bool,
+    scheduler_profile: bool,
+}
+
+impl MdwbConfig {
+    fn from_env() -> Result<Self> {
+        let client_count =
+            read_positive_usize_env("CALVINFS_MDWB_CLIENTS", MDWB_DEFAULT_CLIENT_COUNT)?;
+        let data_set_count =
+            read_positive_usize_env("CALVINFS_MDWB_DATA_SETS", MDWB_DEFAULT_DATA_SET_COUNT)?;
+        let precreate_per_set = read_positive_usize_env(
+            "CALVINFS_MDWB_PRECREATE_PER_SET",
+            MDWB_DEFAULT_PRECREATE_PER_SET,
+        )?;
+        let ops_per_set =
+            read_positive_usize_env("CALVINFS_MDWB_OPS_PER_SET", MDWB_DEFAULT_OPS_PER_SET)?;
+        let iterations =
+            read_positive_usize_env("CALVINFS_MDWB_ITERATIONS", MDWB_DEFAULT_ITERATIONS)?;
+        let batch_size = read_positive_usize_env("CALVINFS_MDWB_BATCH_SIZE", BATCH_SIZE)?;
+
+        let default_offsets = if client_count > 1 { vec![1] } else { vec![0] };
+        let private_offsets =
+            read_usize_list_env("CALVINFS_MDWB_PRIVATE_OFFSETS", &default_offsets, true)?;
+        let default_parent_buckets = default_mdwb_parent_buckets(client_count);
+        let parent_buckets = read_usize_list_env(
+            "CALVINFS_MDWB_PARENT_BUCKETS",
+            &default_parent_buckets,
+            false,
+        )?;
+
+        let config = Self {
+            client_count,
+            data_set_count,
+            precreate_per_set,
+            ops_per_set,
+            iterations,
+            batch_size,
+            private_offsets,
+            parent_buckets,
+            show_ranks: read_bool_env("CALVINFS_MDWB_SHOW_RANKS", false)?,
+            scheduler_profile: read_bool_env("CALVINFS_SCHED_PROFILE", false)?,
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn validate(&self) -> Result<()> {
+        let total_benchmark_deletes = self
+            .ops_per_set
+            .checked_mul(self.iterations)
+            .ok_or_else(|| anyhow::anyhow!("CALVINFS_MDWB_OPS_PER_SET * ITERATIONS overflowed"))?;
+        if total_benchmark_deletes > self.precreate_per_set {
+            bail!(
+                "CALVINFS_MDWB_OPS_PER_SET * CALVINFS_MDWB_ITERATIONS must be <= CALVINFS_MDWB_PRECREATE_PER_SET"
+            );
+        }
+        for offset in self.private_offsets.iter().copied() {
+            if offset >= self.client_count {
+                bail!(
+                    "CALVINFS_MDWB_PRIVATE_OFFSETS entries must be < CALVINFS_MDWB_CLIENTS; got offset={} clients={}",
+                    offset,
+                    self.client_count
+                );
+            }
+        }
+        for parent_count in self.parent_buckets.iter().copied() {
+            if parent_count > self.client_count {
+                bail!(
+                    "CALVINFS_MDWB_PARENT_BUCKETS entries must be <= CALVINFS_MDWB_CLIENTS; got parent_count={} clients={}",
+                    parent_count,
+                    self.client_count
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn scenarios(&self) -> Vec<MdwbScenario> {
+        let mut scenarios =
+            Vec::with_capacity(self.private_offsets.len() + self.parent_buckets.len());
+        for offset in self.private_offsets.iter().copied() {
+            scenarios.push(MdwbScenario::PrivateOffset { offset });
+        }
+        for parent_count in self.parent_buckets.iter().copied() {
+            scenarios.push(MdwbScenario::ParentBuckets { parent_count });
+        }
+        scenarios
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MdwbPhase {
+    Precreate,
+    Benchmark { iteration: usize },
+    Cleanup,
+}
+
+impl MdwbPhase {
+    fn name(self) -> String {
+        match self {
+            Self::Precreate => "Precreate".to_string(),
+            Self::Benchmark { iteration } => format!("Benchmark {iteration}"),
+            Self::Cleanup => "Cleanup".to_string(),
+        }
+    }
+
+    fn is_benchmark(self) -> bool {
+        matches!(self, Self::Benchmark { .. })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct MdwbConflictSummary {
+    benchmark_tx_count: usize,
+    cross_rank_key_conflicts: usize,
+    parent_write_parent_count: usize,
+    max_clients_per_parent: usize,
+    mean_clients_per_parent: f64,
+}
+
+#[derive(Clone, Debug)]
+struct MdwbPhaseSummary {
+    phase: MdwbPhase,
+    ranks: Vec<RankPhaseResult>,
+    profiles: Vec<SchedulerProfileRecord>,
+    total_items: usize,
+    aggregate_seconds: f64,
+    aggregate_ops_per_sec: f64,
+    aggregate_ms_per_op: f64,
+}
+
+#[derive(Clone, Debug)]
+struct MdwbSummary {
+    scheduler: BenchmarkScheduler,
+    scenario: MdwbScenario,
+    conflict: MdwbConflictSummary,
+    phases: Vec<MdwbPhaseSummary>,
+}
+
+impl MdwbPhaseSummary {
+    fn new(
+        phase: MdwbPhase,
+        ranks: Vec<RankPhaseResult>,
+        profiles: Vec<SchedulerProfileRecord>,
+    ) -> Self {
+        let total_items: usize = ranks.iter().map(|rank| rank.items).sum();
+        let aggregate_seconds = ranks
+            .iter()
+            .map(|rank| rank.time.as_secs_f64())
+            .fold(0.0, f64::max);
+        let aggregate_ops_per_sec = if total_items == 0 || aggregate_seconds == 0.0 {
+            0.0
+        } else {
+            total_items as f64 / aggregate_seconds
+        };
+        let aggregate_ms_per_op = if aggregate_ops_per_sec == 0.0 {
+            0.0
+        } else {
+            1000.0 / aggregate_ops_per_sec
+        };
+        Self {
+            phase,
+            ranks,
+            profiles,
+            total_items,
+            aggregate_seconds,
+            aggregate_ops_per_sec,
+            aggregate_ms_per_op,
+        }
+    }
+
+    fn rank_rate_stats(&self) -> FloatStats {
+        float_stats(
+            self.ranks
+                .iter()
+                .map(|rank| ops_per_sec(rank.items, rank.time_before_barrier)),
+        )
+    }
+
+    fn rank_time_stats(&self) -> FloatStats {
+        float_stats(
+            self.ranks
+                .iter()
+                .map(|rank| ms_per_op(rank.items, rank.time_before_barrier)),
+        )
+    }
+}
+
+impl MdwbConflictSummary {
+    fn new(scenario: MdwbScenario, config: &MdwbConfig) -> Result<Self> {
+        let mut benchmark_tx_count = 0usize;
+        let mut readers_by_key: BTreeMap<Key, BTreeSet<usize>> = BTreeMap::new();
+        let mut writers_by_key: BTreeMap<Key, BTreeSet<usize>> = BTreeMap::new();
+        let mut parent_clients: BTreeMap<Key, BTreeSet<usize>> = BTreeMap::new();
+
+        for iteration in 0..config.iterations {
+            for rank in 0..config.client_count {
+                for op in mdwb_benchmark_ops_for_rank(scenario, config, rank, iteration)? {
+                    benchmark_tx_count += 1;
+                    let (read_set, write_set) = derive_read_write_set(&op)?;
+                    for key in read_set {
+                        readers_by_key.entry(key).or_default().insert(rank);
+                    }
+                    for key in write_set {
+                        writers_by_key.entry(key).or_default().insert(rank);
+                    }
+                    if let Some(parent) = mdwb_parent_write_key(&op)? {
+                        parent_clients.entry(parent).or_default().insert(rank);
+                    }
+                }
+            }
+        }
+
+        let cross_rank_key_conflicts =
+            count_cross_rank_key_conflicts(&readers_by_key, &writers_by_key);
+        let parent_write_parent_count = parent_clients.len();
+        let max_clients_per_parent = parent_clients
+            .values()
+            .map(BTreeSet::len)
+            .max()
+            .unwrap_or(0);
+        let mean_clients_per_parent = if parent_clients.is_empty() {
+            0.0
+        } else {
+            parent_clients.values().map(BTreeSet::len).sum::<usize>() as f64
+                / parent_clients.len() as f64
+        };
+
+        Ok(Self {
+            benchmark_tx_count,
+            cross_rank_key_conflicts,
+            parent_write_parent_count,
+            max_clients_per_parent,
+            mean_clients_per_parent,
+        })
+    }
+}
+
+fn count_cross_rank_key_conflicts(
+    readers_by_key: &BTreeMap<Key, BTreeSet<usize>>,
+    writers_by_key: &BTreeMap<Key, BTreeSet<usize>>,
+) -> usize {
+    let mut conflicts = 0usize;
+    for (key, writer_ranks) in writers_by_key {
+        conflicts = conflicts.saturating_add(rank_pair_count(writer_ranks.len()));
+        if let Some(reader_ranks) = readers_by_key.get(key) {
+            for writer_rank in writer_ranks {
+                conflicts = conflicts.saturating_add(
+                    reader_ranks.len() - usize::from(reader_ranks.contains(writer_rank)),
+                );
+            }
+        }
+    }
+    conflicts
+}
+
+fn rank_pair_count(count: usize) -> usize {
+    count.saturating_mul(count.saturating_sub(1)) / 2
+}
+
+async fn run_mdwb_like_cluster(
+    scheduler: BenchmarkScheduler,
+    scenario: MdwbScenario,
+    config: MdwbConfig,
+    network: u8,
+) -> Result<MdwbSummary> {
+    let mut shard_endpoints = BTreeMap::new();
+    for shard_id in 0..SHARD_COUNT {
+        let ip = mdtest_shard_ip(network, shard_id);
+        shard_endpoints.insert(shard_id, endpoint(ip, SHARD_PORT));
+    }
+    for shard_id in 0..SHARD_COUNT {
+        let ip = mdtest_shard_ip(network, shard_id);
+        start_shard_node_with_name(
+            format!(
+                "mdwb-{}-{}-shard-{shard_id}",
+                scheduler.name(),
+                scenario.name()
+            ),
+            shard_id,
+            ip,
+            shard_endpoints.clone(),
+            scheduler.scheduler_kind(),
+        );
+    }
+
+    let sequencer_ip = mdtest_node_ip(network, 100);
+    let sequencer_endpoint = endpoint(sequencer_ip, SEQUENCER_PORT);
+    start_sequencer_node_with_config_and_name(
+        format!("mdwb-{}-{}-sequencer", scheduler.name(), scenario.name()),
+        sequencer_ip,
+        shard_endpoints.clone(),
+        config.batch_size,
+        SequencerConfig::default_batch_flush_interval(),
+    );
+
+    let driver = madsim::runtime::Handle::current()
+        .create_node()
+        .name(format!(
+            "mdwb-{}-{}-driver",
+            scheduler.name(),
+            scenario.name()
+        ))
+        .ip(mdtest_node_ip(network, 200))
+        .build();
+    driver
+        .spawn(run_mdwb_client_driver(
+            scheduler,
+            scenario,
+            sequencer_endpoint,
+            shard_endpoints,
+            config,
+        ))
+        .await
+        .expect("md-workbench-like driver task panicked")
+}
+
+async fn run_mdwb_client_driver(
+    scheduler: BenchmarkScheduler,
+    scenario: MdwbScenario,
+    sequencer_endpoint: String,
+    shard_endpoints: BTreeMap<ShardId, String>,
+    config: MdwbConfig,
+) -> Result<MdwbSummary> {
+    wait_for_shards(&shard_endpoints).await?;
+    wait_for_sequencer(&sequencer_endpoint).await?;
+
+    let mut sequencer =
+        pb::sequencer_client::SequencerClient::connect(sequencer_endpoint.clone()).await?;
+    setup_mdwb_scenario(&mut sequencer, &shard_endpoints, scenario, &config).await?;
+
+    let conflict = MdwbConflictSummary::new(scenario, &config)?;
+    let mut seen_profile_keys = BTreeSet::new();
+    if config.scheduler_profile {
+        let _ = collect_new_scheduler_profiles(&shard_endpoints, &mut seen_profile_keys).await?;
+    }
+
+    let mut phases = Vec::new();
+    let ranks = run_mdwb_phase(
+        MdwbPhase::Precreate,
+        scenario,
+        &config,
+        &sequencer_endpoint,
+        &shard_endpoints,
+    )
+    .await?;
+    let profiles = if config.scheduler_profile {
+        collect_new_scheduler_profiles(&shard_endpoints, &mut seen_profile_keys).await?
+    } else {
+        Vec::new()
+    };
+    phases.push(MdwbPhaseSummary::new(MdwbPhase::Precreate, ranks, profiles));
+
+    for iteration in 0..config.iterations {
+        let phase = MdwbPhase::Benchmark { iteration };
+        let ranks = run_mdwb_phase(
+            phase,
+            scenario,
+            &config,
+            &sequencer_endpoint,
+            &shard_endpoints,
+        )
+        .await?;
+        let profiles = if config.scheduler_profile {
+            collect_new_scheduler_profiles(&shard_endpoints, &mut seen_profile_keys).await?
+        } else {
+            Vec::new()
+        };
+        phases.push(MdwbPhaseSummary::new(phase, ranks, profiles));
+    }
+
+    let ranks = run_mdwb_phase(
+        MdwbPhase::Cleanup,
+        scenario,
+        &config,
+        &sequencer_endpoint,
+        &shard_endpoints,
+    )
+    .await?;
+    let profiles = if config.scheduler_profile {
+        collect_new_scheduler_profiles(&shard_endpoints, &mut seen_profile_keys).await?
+    } else {
+        Vec::new()
+    };
+    phases.push(MdwbPhaseSummary::new(MdwbPhase::Cleanup, ranks, profiles));
+
+    cleanup_mdwb_scenario_dirs(&mut sequencer, &shard_endpoints, scenario, &config).await?;
+    submit_client_tx(
+        &mut sequencer,
+        &shard_endpoints,
+        &format!("mdwb:{}:sanity:stat_removed_root", scenario.name()),
+        stat(MDWB_ROOT)?,
+        TxResult::NotFound,
+    )
+    .await?;
+    assert_mdwb_cluster_clean(&shard_endpoints).await?;
+
+    Ok(MdwbSummary {
+        scheduler,
+        scenario,
+        conflict,
+        phases,
+    })
+}
+
+async fn setup_mdwb_scenario(
+    sequencer: &mut pb::sequencer_client::SequencerClient<tonic::transport::Channel>,
+    shard_endpoints: &BTreeMap<ShardId, String>,
+    scenario: MdwbScenario,
+    config: &MdwbConfig,
+) -> Result<()> {
+    submit_client_tx(
+        sequencer,
+        shard_endpoints,
+        "mdwb:setup:mkdir_root",
+        mkdir("/")?,
+        TxResult::Ok,
+    )
+    .await?;
+    submit_client_tx(
+        sequencer,
+        shard_endpoints,
+        "mdwb:setup:mkdir_mdwb",
+        mkdir(MDWB_ROOT)?,
+        TxResult::Ok,
+    )
+    .await?;
+    submit_client_tx(
+        sequencer,
+        shard_endpoints,
+        &format!("mdwb:{}:setup:mkdir_scenario", scenario.name()),
+        mkdir(&scenario.root())?,
+        TxResult::Ok,
+    )
+    .await?;
+
+    match scenario {
+        MdwbScenario::PrivateOffset { .. } => {
+            for rank in 0..config.client_count {
+                submit_client_tx(
+                    sequencer,
+                    shard_endpoints,
+                    &format!("mdwb:{}:setup:mkdir_rank_{rank}", scenario.name()),
+                    mkdir(&mdwb_private_rank_root(scenario, rank))?,
+                    TxResult::Ok,
+                )
+                .await?;
+                for data_set in 0..config.data_set_count {
+                    submit_client_tx(
+                        sequencer,
+                        shard_endpoints,
+                        &format!(
+                            "mdwb:{}:setup:mkdir_rank_{rank}_set_{data_set}",
+                            scenario.name()
+                        ),
+                        mkdir(&mdwb_private_parent(scenario, rank, data_set))?,
+                        TxResult::Ok,
+                    )
+                    .await?;
+                }
+            }
+        }
+        MdwbScenario::ParentBuckets { parent_count } => {
+            for bucket in 0..parent_count {
+                submit_client_tx(
+                    sequencer,
+                    shard_endpoints,
+                    &format!("mdwb:{}:setup:mkdir_bucket_{bucket}", scenario.name()),
+                    mkdir(&mdwb_bucket_parent(scenario, bucket))?,
+                    TxResult::Ok,
+                )
+                .await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn cleanup_mdwb_scenario_dirs(
+    sequencer: &mut pb::sequencer_client::SequencerClient<tonic::transport::Channel>,
+    shard_endpoints: &BTreeMap<ShardId, String>,
+    scenario: MdwbScenario,
+    config: &MdwbConfig,
+) -> Result<()> {
+    match scenario {
+        MdwbScenario::PrivateOffset { .. } => {
+            for rank in 0..config.client_count {
+                for data_set in 0..config.data_set_count {
+                    submit_client_tx(
+                        sequencer,
+                        shard_endpoints,
+                        &format!(
+                            "mdwb:{}:cleanup:rmdir_rank_{rank}_set_{data_set}",
+                            scenario.name()
+                        ),
+                        rmdir(&mdwb_private_parent(scenario, rank, data_set))?,
+                        TxResult::Ok,
+                    )
+                    .await?;
+                }
+                submit_client_tx(
+                    sequencer,
+                    shard_endpoints,
+                    &format!("mdwb:{}:cleanup:rmdir_rank_{rank}", scenario.name()),
+                    rmdir(&mdwb_private_rank_root(scenario, rank))?,
+                    TxResult::Ok,
+                )
+                .await?;
+            }
+        }
+        MdwbScenario::ParentBuckets { parent_count } => {
+            for bucket in 0..parent_count {
+                submit_client_tx(
+                    sequencer,
+                    shard_endpoints,
+                    &format!("mdwb:{}:cleanup:rmdir_bucket_{bucket}", scenario.name()),
+                    rmdir(&mdwb_bucket_parent(scenario, bucket))?,
+                    TxResult::Ok,
+                )
+                .await?;
+            }
+        }
+    }
+
+    submit_client_tx(
+        sequencer,
+        shard_endpoints,
+        &format!("mdwb:{}:cleanup:rmdir_scenario", scenario.name()),
+        rmdir(&scenario.root())?,
+        TxResult::Ok,
+    )
+    .await?;
+    submit_client_tx(
+        sequencer,
+        shard_endpoints,
+        "mdwb:cleanup:rmdir_mdwb",
+        rmdir(MDWB_ROOT)?,
+        TxResult::Ok,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn run_mdwb_phase(
+    phase: MdwbPhase,
+    scenario: MdwbScenario,
+    config: &MdwbConfig,
+    sequencer_endpoint: &str,
+    shard_endpoints: &BTreeMap<ShardId, String>,
+) -> Result<Vec<RankPhaseResult>> {
+    let start_barrier = Arc::new(tokio::sync::Barrier::new(config.client_count));
+    let end_barrier = Arc::new(tokio::sync::Barrier::new(config.client_count));
+    let mut handles = Vec::with_capacity(config.client_count);
+
+    for rank in 0..config.client_count {
+        let config = config.clone();
+        let sequencer_endpoint = sequencer_endpoint.to_string();
+        let shard_endpoints = shard_endpoints.clone();
+        let start_barrier = start_barrier.clone();
+        let end_barrier = end_barrier.clone();
+        handles.push(tokio::spawn(async move {
+            run_mdwb_rank_phase(MdwbRankPhaseInput {
+                phase,
+                scenario,
+                config,
+                rank,
+                sequencer_endpoint,
+                shard_endpoints,
+                start_barrier,
+                end_barrier,
+            })
+            .await
+        }));
+    }
+
+    let mut results = Vec::with_capacity(config.client_count);
+    for handle in handles {
+        results.push(handle.await.expect("md-workbench client task panicked")?);
+    }
+    results.sort_by_key(|result| result.rank);
+    Ok(results)
+}
+
+struct MdwbRankPhaseInput {
+    phase: MdwbPhase,
+    scenario: MdwbScenario,
+    config: MdwbConfig,
+    rank: usize,
+    sequencer_endpoint: String,
+    shard_endpoints: BTreeMap<ShardId, String>,
+    start_barrier: Arc<tokio::sync::Barrier>,
+    end_barrier: Arc<tokio::sync::Barrier>,
+}
+
+async fn run_mdwb_rank_phase(input: MdwbRankPhaseInput) -> Result<RankPhaseResult> {
+    let MdwbRankPhaseInput {
+        phase,
+        scenario,
+        config,
+        rank,
+        sequencer_endpoint,
+        shard_endpoints,
+        start_barrier,
+        end_barrier,
+    } = input;
+
+    let ops = mdwb_phase_ops_for_rank(phase, scenario, &config, rank)?;
+    let mut sequencer = pb::sequencer_client::SequencerClient::connect(sequencer_endpoint).await?;
+    let mut shard_clients = connect_shard_clients(&shard_endpoints).await?;
+
+    start_barrier.wait().await;
+    let started = Instant::now();
+
+    let mut submitted = Vec::with_capacity(ops.len());
+    for (op_index, op) in ops.into_iter().enumerate() {
+        let label = format!(
+            "mdwb:{}:{}:rank_{rank}:op_{op_index}",
+            scenario.name(),
+            phase.name()
+        );
+        let response = sequencer
+            .submit_tx(pb::SubmitTxRequest {
+                op: Some(fs_op_to_proto(&op)),
+            })
+            .await?
+            .into_inner();
+        submitted.push(SubmittedClientTx {
+            label,
+            expected: TxResult::Ok,
+            tx_id: response.tx_id,
+            result_shard: response.result_shard,
+        });
+    }
+
+    for tx in &submitted {
+        let shard = shard_clients
+            .get_mut(&tx.result_shard)
+            .expect("result shard client should be connected");
+        let result = shard
+            .get_tx_result(pb::GetTxResultRequest { tx_id: tx.tx_id })
+            .await?
+            .into_inner();
+        assert_ready_result(&tx.label, &result, tx.expected)?;
+    }
+
+    let time_before_barrier = started.elapsed();
+    end_barrier.wait().await;
+    let time = started.elapsed();
+
+    Ok(RankPhaseResult {
+        rank,
+        items: submitted.len(),
+        time_before_barrier,
+        time,
+    })
+}
+
+fn mdwb_phase_ops_for_rank(
+    phase: MdwbPhase,
+    scenario: MdwbScenario,
+    config: &MdwbConfig,
+    rank: usize,
+) -> Result<Vec<FsOp>> {
+    match phase {
+        MdwbPhase::Precreate => mdwb_precreate_ops_for_rank(scenario, config, rank),
+        MdwbPhase::Benchmark { iteration } => {
+            mdwb_benchmark_ops_for_rank(scenario, config, rank, iteration)
+        }
+        MdwbPhase::Cleanup => mdwb_cleanup_ops_for_rank(scenario, config, rank),
+    }
+}
+
+fn mdwb_precreate_ops_for_rank(
+    scenario: MdwbScenario,
+    config: &MdwbConfig,
+    rank: usize,
+) -> Result<Vec<FsOp>> {
+    let mut ops = Vec::with_capacity(config.data_set_count * config.precreate_per_set);
+    for data_set in 0..config.data_set_count {
+        for file_index in 0..config.precreate_per_set {
+            ops.push(create(&mdwb_owner_object_path(
+                scenario, rank, data_set, file_index,
+            ))?);
+        }
+    }
+    Ok(ops)
+}
+
+fn mdwb_benchmark_ops_for_rank(
+    scenario: MdwbScenario,
+    config: &MdwbConfig,
+    rank: usize,
+    iteration: usize,
+) -> Result<Vec<FsOp>> {
+    let mut ops = Vec::with_capacity(config.data_set_count * config.ops_per_set * 3);
+    let start_index = iteration * config.ops_per_set;
+    for data_set in 0..config.data_set_count {
+        for item in 0..config.ops_per_set {
+            let previous_index = start_index + item;
+            let new_index = config.precreate_per_set + previous_index;
+            let previous =
+                mdwb_benchmark_read_object_path(scenario, config, rank, data_set, previous_index);
+            ops.push(stat(&previous)?);
+            ops.push(unlink(&previous)?);
+            ops.push(create(&mdwb_benchmark_write_object_path(
+                scenario, config, rank, data_set, new_index,
+            ))?);
+        }
+    }
+    Ok(ops)
+}
+
+fn mdwb_cleanup_ops_for_rank(
+    scenario: MdwbScenario,
+    config: &MdwbConfig,
+    rank: usize,
+) -> Result<Vec<FsOp>> {
+    let final_start = config.ops_per_set * config.iterations;
+    let mut ops = Vec::with_capacity(config.data_set_count * config.precreate_per_set);
+    for data_set in 0..config.data_set_count {
+        for file_index in final_start..(final_start + config.precreate_per_set) {
+            ops.push(unlink(&mdwb_owner_object_path(
+                scenario, rank, data_set, file_index,
+            ))?);
+        }
+    }
+    Ok(ops)
+}
+
+fn mdwb_benchmark_read_object_path(
+    scenario: MdwbScenario,
+    config: &MdwbConfig,
+    rank: usize,
+    data_set: usize,
+    file_index: usize,
+) -> String {
+    match scenario {
+        MdwbScenario::PrivateOffset { offset } => {
+            let target_rank = mdwb_offset_rank(rank, offset, data_set, config.client_count, false);
+            mdwb_private_object_path(scenario, target_rank, data_set, file_index)
+        }
+        MdwbScenario::ParentBuckets { .. } => {
+            mdwb_bucket_object_path(scenario, rank, data_set, file_index)
+        }
+    }
+}
+
+fn mdwb_benchmark_write_object_path(
+    scenario: MdwbScenario,
+    config: &MdwbConfig,
+    rank: usize,
+    data_set: usize,
+    file_index: usize,
+) -> String {
+    match scenario {
+        MdwbScenario::PrivateOffset { offset } => {
+            let target_rank = mdwb_offset_rank(rank, offset, data_set, config.client_count, true);
+            mdwb_private_object_path(scenario, target_rank, data_set, file_index)
+        }
+        MdwbScenario::ParentBuckets { .. } => {
+            mdwb_bucket_object_path(scenario, rank, data_set, file_index)
+        }
+    }
+}
+
+fn mdwb_owner_object_path(
+    scenario: MdwbScenario,
+    rank: usize,
+    data_set: usize,
+    file_index: usize,
+) -> String {
+    match scenario {
+        MdwbScenario::PrivateOffset { .. } => {
+            mdwb_private_object_path(scenario, rank, data_set, file_index)
+        }
+        MdwbScenario::ParentBuckets { .. } => {
+            mdwb_bucket_object_path(scenario, rank, data_set, file_index)
+        }
+    }
+}
+
+fn mdwb_offset_rank(
+    rank: usize,
+    offset: usize,
+    data_set: usize,
+    client_count: usize,
+    forward: bool,
+) -> usize {
+    let step = ((offset % client_count) * ((data_set + 1) % client_count)) % client_count;
+    if forward {
+        (rank + step) % client_count
+    } else {
+        (rank + client_count - step) % client_count
+    }
+}
+
+fn mdwb_private_rank_root(scenario: MdwbScenario, rank: usize) -> String {
+    format!("{}/rank_{rank}", scenario.root())
+}
+
+fn mdwb_private_parent(scenario: MdwbScenario, rank: usize, data_set: usize) -> String {
+    format!("{}/set_{data_set}", mdwb_private_rank_root(scenario, rank))
+}
+
+fn mdwb_private_object_path(
+    scenario: MdwbScenario,
+    rank: usize,
+    data_set: usize,
+    file_index: usize,
+) -> String {
+    format!(
+        "{}/file_{file_index}",
+        mdwb_private_parent(scenario, rank, data_set)
+    )
+}
+
+fn mdwb_bucket_parent(scenario: MdwbScenario, bucket: usize) -> String {
+    format!("{}/bucket_{bucket}", scenario.root())
+}
+
+fn mdwb_bucket_object_path(
+    scenario: MdwbScenario,
+    rank: usize,
+    data_set: usize,
+    file_index: usize,
+) -> String {
+    let MdwbScenario::ParentBuckets { parent_count } = scenario else {
+        unreachable!("bucket object path is only valid for parent-bucket scenarios");
+    };
+    let bucket = rank % parent_count;
+    format!(
+        "{}/rank_{rank}_set_{data_set}_file_{file_index}",
+        mdwb_bucket_parent(scenario, bucket)
+    )
+}
+
+fn mdwb_parent_write_key(op: &FsOp) -> Result<Option<Key>> {
+    match op {
+        FsOp::Create { path } | FsOp::Unlink { path } | FsOp::Rmdir { path }
+            if path.as_str() != "/" =>
+        {
+            Ok(Some(path.parent()?))
+        }
+        FsOp::Rename { src, dst } if src.as_str() != "/" && dst.as_str() != "/" => {
+            Ok(Some(dst.parent()?))
+        }
+        _ => Ok(None),
+    }
+}
+
+async fn assert_mdwb_cluster_clean(shard_endpoints: &BTreeMap<ShardId, String>) -> Result<()> {
+    let mut shard_states = Vec::new();
+    for (shard_id, endpoint) in shard_endpoints {
+        let mut client = pb::shard_client::ShardClient::connect(endpoint.clone()).await?;
+        let response = client
+            .dump_state(pb::DumpStateRequest {})
+            .await?
+            .into_inner();
+        shard_states.push((*shard_id, inode_entries_from_proto(response.entries)?));
+    }
+    let layout = ShardLayout::new(SHARD_COUNT);
+    let actual = merge_shard_states(&layout, shard_states)?;
+    let root = Key::root();
+    if actual.len() != 1 || !actual.contains_key(&root) {
+        bail!("md-workbench cleanup should leave only root, got {actual:?}");
+    }
+    Ok(())
+}
+
 async fn run_mdtest_mode(
     scheduler: BenchmarkScheduler,
     mode: MdtestMode,
@@ -2077,6 +3030,230 @@ fn print_scheduler_comparison(
     }
 }
 
+fn print_mdwb_summary(summary: &MdwbSummary, show_ranks: bool) {
+    println!(
+        "\n{} {} ({}) conflict summary:",
+        summary.scheduler.display_name(),
+        summary.scenario.name(),
+        summary.scenario.mode_name()
+    );
+    println!(
+        "benchmark_txs={} cross_rank_key_conflicts={} parent_count={} max_clients/parent={} mean_clients/parent={:.2}",
+        summary.conflict.benchmark_tx_count,
+        summary.conflict.cross_rank_key_conflicts,
+        summary.conflict.parent_write_parent_count,
+        summary.conflict.max_clients_per_parent,
+        summary.conflict.mean_clients_per_parent
+    );
+
+    println!(
+        "\n{} {} SUMMARY rate (in ops/sec):",
+        summary.scheduler.display_name(),
+        summary.scenario.name()
+    );
+    println!(
+        "{:<22} {:>14} {:>14} {:>14}    {:>14} {:>14} {:>14} {:>14}",
+        "Operation",
+        "Rank Max",
+        "Rank Min",
+        "Rank Mean",
+        "Iter Max",
+        "Iter Min",
+        "Iter Mean",
+        "Std Dev"
+    );
+    for phase in &summary.phases {
+        let stats = phase.rank_rate_stats();
+        let phase_name = phase.phase.name();
+        print_summary_row(
+            &phase_name,
+            stats,
+            phase.aggregate_ops_per_sec,
+            phase.aggregate_ops_per_sec,
+            phase.aggregate_ops_per_sec,
+            0.0,
+        );
+    }
+
+    println!(
+        "\n{} {} SUMMARY time (in ms/op):",
+        summary.scheduler.display_name(),
+        summary.scenario.name()
+    );
+    println!(
+        "{:<22} {:>14} {:>14} {:>14}    {:>14} {:>14} {:>14} {:>14}",
+        "Operation",
+        "Rank Max",
+        "Rank Min",
+        "Rank Mean",
+        "Iter Max",
+        "Iter Min",
+        "Iter Mean",
+        "Std Dev"
+    );
+    for phase in &summary.phases {
+        let stats = phase.rank_time_stats();
+        let phase_name = phase.phase.name();
+        print_summary_row(
+            &phase_name,
+            stats,
+            phase.aggregate_ms_per_op,
+            phase.aggregate_ms_per_op,
+            phase.aggregate_ms_per_op,
+            0.0,
+        );
+    }
+
+    print_mdwb_scheduler_profile_summary(summary);
+
+    if show_ranks {
+        println!(
+            "\n{} {} per-rank details:",
+            summary.scheduler.display_name(),
+            summary.scenario.name()
+        );
+        println!(
+            "{:<22} {:>6} {:>8} {:>14} {:>14} {:>14}",
+            "Operation", "Rank", "Items", "Ops/sec", "ms/op", "Elapsed ms"
+        );
+        for phase in &summary.phases {
+            let phase_name = phase.phase.name();
+            for rank in &phase.ranks {
+                println!(
+                    "{:<22} {:>6} {:>8} {:>14.3} {:>14.6} {:>14.3}",
+                    phase_name,
+                    rank.rank,
+                    rank.items,
+                    ops_per_sec(rank.items, rank.time_before_barrier),
+                    ms_per_op(rank.items, rank.time_before_barrier),
+                    rank.time_before_barrier.as_secs_f64() * 1000.0
+                );
+            }
+        }
+    }
+}
+
+fn print_mdwb_scheduler_profile_summary(summary: &MdwbSummary) {
+    if summary.phases.iter().all(|phase| phase.profiles.is_empty()) {
+        return;
+    }
+
+    println!(
+        "\n{} {} scheduler profile:",
+        summary.scheduler.display_name(),
+        summary.scenario.name()
+    );
+    println!(
+        "{:<22} {:>7} {:>12} {:>46} {:>10} {:>13} {:>10}",
+        "Operation", "Records", "Total ms", "Top stages", "Edges", "Remote msgs", "Fallback"
+    );
+    for phase in &summary.phases {
+        if phase.profiles.is_empty() {
+            continue;
+        }
+        let total_ns = sum_profile_stage(&phase.profiles, |profile| profile.timings.total_ns);
+        let edge_count = sum_profile_counter(&phase.profiles, |profile| {
+            profile
+                .counters
+                .effect_edge_count
+                .saturating_add(profile.counters.condition_edge_count)
+        });
+        let remote_messages = sum_profile_counter(&phase.profiles, |profile| {
+            profile
+                .counters
+                .remote_read_messages_sent
+                .saturating_add(profile.counters.remote_read_messages_received)
+        });
+        let fallback_tx = sum_profile_counter(&phase.profiles, |profile| {
+            profile.counters.fallback_tx_count
+        });
+        let phase_name = phase.phase.name();
+        println!(
+            "{:<22} {:>7} {:>12.3} {:>46} {:>10} {:>13} {:>10}",
+            phase_name,
+            phase.profiles.len(),
+            ns_to_ms(total_ns),
+            top_profile_stages(&phase.profiles),
+            edge_count,
+            remote_messages,
+            fallback_tx
+        );
+    }
+}
+
+fn print_mdwb_scheduler_comparison(summaries: &[MdwbSummary]) -> Result<()> {
+    let mut scenarios = Vec::new();
+    for summary in summaries {
+        if !scenarios.contains(&summary.scenario) {
+            scenarios.push(summary.scenario);
+        }
+    }
+
+    println!("\nmd-workbench-like SCC/Calvin benchmark comparison:");
+    println!(
+        "{:<24} {:>12} {:>12} {:>12} {:>10} {:>14} {:>18}",
+        "Scenario",
+        "Calvin ops/s",
+        "SCC ops/s",
+        "SCC/Calvin",
+        "Max fan-in",
+        "Key conflicts",
+        "Mode"
+    );
+    for scenario in scenarios {
+        let calvin = summaries
+            .iter()
+            .find(|summary| {
+                summary.scenario == scenario && summary.scheduler == BenchmarkScheduler::Calvin
+            })
+            .ok_or_else(|| anyhow::anyhow!("missing Calvin summary for {}", scenario.name()))?;
+        let scc = summaries
+            .iter()
+            .find(|summary| {
+                summary.scenario == scenario && summary.scheduler == BenchmarkScheduler::Scc
+            })
+            .ok_or_else(|| anyhow::anyhow!("missing SCC summary for {}", scenario.name()))?;
+        let calvin_rate = mdwb_benchmark_ops_per_sec(calvin);
+        let scc_rate = mdwb_benchmark_ops_per_sec(scc);
+        let ratio = if calvin_rate == 0.0 {
+            0.0
+        } else {
+            scc_rate / calvin_rate
+        };
+        println!(
+            "{:<24} {:>12.3} {:>12.3} {:>12.3} {:>10} {:>14} {:>18}",
+            scenario.name(),
+            calvin_rate,
+            scc_rate,
+            ratio,
+            calvin.conflict.max_clients_per_parent,
+            calvin.conflict.cross_rank_key_conflicts,
+            scenario.mode_name()
+        );
+    }
+    Ok(())
+}
+
+fn mdwb_benchmark_ops_per_sec(summary: &MdwbSummary) -> f64 {
+    let total_items: usize = summary
+        .phases
+        .iter()
+        .filter(|phase| phase.phase.is_benchmark())
+        .map(|phase| phase.total_items)
+        .sum();
+    let total_seconds: f64 = summary
+        .phases
+        .iter()
+        .filter(|phase| phase.phase.is_benchmark())
+        .map(|phase| phase.aggregate_seconds)
+        .sum();
+    if total_items == 0 || total_seconds == 0.0 {
+        0.0
+    } else {
+        total_items as f64 / total_seconds
+    }
+}
+
 fn read_positive_usize_env(name: &str, default: usize) -> Result<usize> {
     let Some(value) = env::var_os(name) else {
         return Ok(default);
@@ -2089,6 +3266,45 @@ fn read_positive_usize_env(name: &str, default: usize) -> Result<usize> {
         bail!("{name} must be greater than zero");
     }
     Ok(parsed)
+}
+
+fn read_usize_list_env(name: &str, default: &[usize], allow_zero: bool) -> Result<Vec<usize>> {
+    let Some(value) = env::var_os(name) else {
+        return Ok(default.to_vec());
+    };
+    let value = value.to_string_lossy();
+    let mut parsed = Vec::new();
+    for part in value.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            bail!("{name} must be a comma-separated list of integers");
+        }
+        let item = part
+            .parse::<usize>()
+            .map_err(|err| anyhow::anyhow!("{name} contains invalid integer {part}: {err}"))?;
+        if !allow_zero && item == 0 {
+            bail!("{name} entries must be greater than zero");
+        }
+        if !parsed.contains(&item) {
+            parsed.push(item);
+        }
+    }
+    if parsed.is_empty() {
+        bail!("{name} must not be empty");
+    }
+    Ok(parsed)
+}
+
+fn default_mdwb_parent_buckets(client_count: usize) -> Vec<usize> {
+    let mut buckets = Vec::new();
+    let medium = client_count.min(4);
+    if medium > 0 {
+        buckets.push(medium);
+    }
+    if !buckets.contains(&1) {
+        buckets.push(1);
+    }
+    buckets
 }
 
 fn read_bool_env(name: &str, default: bool) -> Result<bool> {
